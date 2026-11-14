@@ -2669,7 +2669,9 @@ def setup_email_routes():
             msg_out["From"] = email.utils.formataddr((cfg.get("display_name") or "", cfg["from_address"]))
             msg_out["To"] = target
             msg_out["Subject"] = subject
-            msg_out["Message-ID"] = email.utils.make_msgid(domain="odysseus.local")
+            # Message-ID domain must resolve (recipient MX/spam checks): derive it
+            # from the sender address, never a hard-coded container hostname.
+            msg_out["Message-ID"] = email.utils.make_msgid(domain=(cfg["from_address"].rpartition("@")[2] or "odysseus.local"))
             _apply_odysseus_headers(msg_out, "unsubscribe", uid)
             _send_smtp_message(cfg, cfg["from_address"], [target], msg_out.as_string())
             moved = False
@@ -4581,7 +4583,9 @@ def setup_email_routes():
             outer["Cc"] = req.cc
         outer["Subject"] = req.subject
         outer["Date"] = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000")
-        outer["Message-ID"] = email.utils.make_msgid(domain="odysseus.local")
+        # Message-ID domain must resolve (recipient MX/spam checks): derive it
+        # from the sender address, never a hard-coded container hostname.
+        outer["Message-ID"] = email.utils.make_msgid(domain=(cfg["from_address"].rpartition("@")[2] or "odysseus.local"))
 
         if req.in_reply_to:
             outer["In-Reply-To"] = req.in_reply_to
