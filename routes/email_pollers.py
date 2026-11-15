@@ -353,7 +353,10 @@ def _send_away_reply(settings: dict, account_owner: str, account_id: str | None,
     outer["To"] = email.utils.formataddr((sender_name, sender_addr)) if sender_name else sender_addr
     outer["Subject"] = reply_subject
     outer["Date"] = email.utils.formatdate(localtime=False)
-    outer["Message-ID"] = email.utils.make_msgid()
+    # Anchor the Message-ID to the sender domain: bare make_msgid() uses
+    # socket.getfqdn() (odysseus.local in the container), which does not
+    # resolve and gets the mail spam-flagged by recipients.
+    outer["Message-ID"] = email.utils.make_msgid(domain=(from_addr.rpartition("@")[2] or "odysseus.local"))
     outer["Auto-Submitted"] = "auto-replied"
     outer["X-Auto-Response-Suppress"] = "All"
     if message_id:

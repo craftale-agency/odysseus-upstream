@@ -1565,7 +1565,10 @@ def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, b
     if "Date" not in msg:
         msg["Date"] = email.utils.formatdate(localtime=True)
     if "Message-ID" not in msg:
-        msg["Message-ID"] = email.utils.make_msgid()
+        # Anchor the Message-ID to the sender domain: bare make_msgid() uses
+        # socket.getfqdn() (odysseus.local in the container), which does not
+        # resolve and gets the mail spam-flagged by recipients.
+        msg["Message-ID"] = email.utils.make_msgid(domain=(cfg["from_address"].rpartition("@")[2] or "odysseus.local"))
     msg.set_content(body)
 
     recipients = []
