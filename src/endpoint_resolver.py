@@ -7,6 +7,7 @@ Consolidates the 4+ copies of normalize_base / resolve_endpoint logic into one p
 import json
 import ipaddress
 import logging
+import os
 import socket
 import subprocess
 from typing import Optional, Tuple, Dict
@@ -63,6 +64,30 @@ def endpoint_cost_tracked(url: str, endpoint_kind: Optional[str] = None) -> bool
     if "." not in host:
         return False
     return True
+
+
+def _running_in_container() -> bool:
+    if os.path.exists("/.dockerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", encoding="utf-8") as fh:
+            return any(
+                marker in fh.read()
+                for marker in ("docker", "containerd", "kubepods")
+            )
+    except OSError:
+        return False
+
+
+def _rewrite_docker_host_for_native_runtime(base: str) -> str:
+    """Make Docker-saved host endpoints usable by a native backend process."""
+    if _running_in_container():
+        return base
+    parsed = urlparse(base)
+    if (parsed.hostname or "").lower() != "host.docker.internal":
+        return base
+    netloc = "127.0.0.1" + (f":{parsed.port}" if parsed.port else "")
+    return urlunparse(parsed._replace(netloc=netloc))
 
 
 def _first_chat_model(models) -> Optional[str]:
@@ -143,6 +168,25 @@ def _endpoint_enabled_models(ep) -> list:
     return [m for m in merged if m not in hidden]
 
 
+def _endpoint_has_known_model_inventory(ep) -> bool:
+    """Return whether endpoint configuration proves its catalog is known.
+
+    Hidden model ids remain evidence of a configured inventory even when every
+    cached or pinned model is hidden.  Exact foreground resolution must not
+    reinterpret that state as an unknown catalog where arbitrary model ids are
+    accepted.
+    """
+
+    return any(
+        isinstance(model, str) and bool(model.strip())
+        for model in [
+            *_endpoint_cached_models(ep),
+            *_endpoint_pinned_models(ep),
+            *_endpoint_hidden_models(ep),
+        ]
+    )
+
+
 def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Optional[str]]:
     """Resolve a ModelEndpoint row to its runtime base URL and bearer/API key.
 
@@ -150,14 +194,18 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
     store refreshable credentials in ProviderAuthSession and must resolve a
     current access token at call time.
     """
-    base = normalize_base(getattr(ep, "base_url", "") or "")
+    base = _rewrite_docker_host_for_native_runtime(
+        normalize_base(getattr(ep, "base_url", "") or "")
+    )
     api_key = getattr(ep, "api_key", None)
     auth_id = getattr(ep, "provider_auth_id", None)
     if auth_id:
         from src.chatgpt_subscription import resolve_runtime_credentials
 
         creds = resolve_runtime_credentials(auth_id, owner=owner)
-        base = normalize_base(creds.get("base_url") or base)
+        base = _rewrite_docker_host_for_native_runtime(
+            normalize_base(creds.get("base_url") or base)
+        )
         api_key = creds.get("api_key")
     return base, api_key
 
@@ -232,6 +280,74 @@ def normalize_base(url: str) -> str:
         if url.endswith("/api" + suffix):
             url = url[: -len(suffix)].rstrip("/")
     return url
+
+
+def same_endpoint_base(left, right) -> bool:
+    """Allow credential reuse only for the exact API origin and base path."""
+    def identity(value):
+        parsed = urlparse(normalize_base(value))
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or parsed.params):
+            return None
+        return (parsed.scheme, parsed.hostname.lower(),
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                parsed.path.rstrip("/"))
+    try:
+        expected = identity(right)
+        return expected is not None and identity(left) == expected
+    except ValueError:
+        return False
+
+
+def _registered_endpoint_url_identity(value):
+    """Compare complete URL paths without collapsing caller-selected suffixes."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    try:
+        parsed = urlparse(value)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or "?" in value or "#" in value or parsed.params):
+            return None
+        port = parsed.port
+        return (parsed.scheme, parsed.hostname.lower(),
+                port if port is not None else (443 if parsed.scheme == "https" else 80),
+                parsed.path.rstrip("/"))
+    except ValueError:
+        return None
+
+
+def resolve_owner_registered_endpoint(db, endpoint_url: str, owner: Optional[str] = None):
+    """Authorize a caller URL against enabled, owner-visible endpoint rows.
+
+    Accept only the registered canonical base or its server-derived chat URL.
+    Request credentials, query strings and fragments are never endpoint identity.
+    Return the server-owned row so runtime credentials come from registration.
+    """
+    from src.auth_helpers import owner_filter
+
+    identity = _registered_endpoint_url_identity(endpoint_url)
+    if identity is None:
+        raise ValueError("Invalid model endpoint URL")
+    query = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled.is_(True))
+    for endpoint in owner_filter(query, ModelEndpoint, owner).all():
+        base = normalize_base(endpoint.base_url)
+        base_identity = _registered_endpoint_url_identity(base)
+        if base_identity is None:
+            continue
+        if identity == base_identity:
+            return endpoint
+        if identity == _registered_endpoint_url_identity(build_chat_url(base)):
+            return endpoint
+    raise ValueError("Model endpoint must be enabled and registered for the current owner")
+
+
+def resolve_owner_registered_endpoint_url(db, endpoint_url: str, owner: Optional[str] = None) -> str:
+    """Return only the registered canonical base, never the caller's URL."""
+    endpoint = resolve_owner_registered_endpoint(db, endpoint_url, owner)
+    return normalize_base(endpoint.base_url)
 
 
 def _validated_endpoint_base(url: str) -> str:
@@ -440,6 +556,7 @@ def _resolve_endpoint_by_id_with_descriptor(
     owner: Optional[str] = None,
     *,
     require_exact_model: bool = False,
+    required_model_type: Optional[str] = None,
 ) -> Optional[Tuple[Tuple[str, str, Dict], dict]]:
     """Resolve a concrete endpoint/model plus its non-secret descriptor.
 
@@ -460,6 +577,10 @@ def _resolve_endpoint_by_id_with_descriptor(
         ep = q.first()
         if not ep:
             return None
+        if required_model_type:
+            model_type = getattr(ep, "model_type", None) or "llm"
+            if model_type != required_model_type:
+                return None
         try:
             base, api_key = resolve_endpoint_runtime(ep, owner=owner)
         except Exception as e:
@@ -475,7 +596,7 @@ def _resolve_endpoint_by_id_with_descriptor(
             # silently substituting another model from the endpoint.
             if not m or m in _endpoint_hidden_models(ep):
                 return None
-            if enabled_models and m not in enabled_models:
+            if _endpoint_has_known_model_inventory(ep) and m not in enabled_models:
                 return None
         else:
             # Legacy Utility/Vision chains retain their model-repair behavior.
@@ -648,6 +769,7 @@ def resolve_fallback_entries_with_descriptors(
     owner: Optional[str] = None,
     *,
     require_exact_model: bool = False,
+    required_model_type: Optional[str] = None,
 ) -> list:
     """Resolve ordered entries while retaining safe endpoint provenance."""
 
@@ -661,6 +783,7 @@ def resolve_fallback_entries_with_descriptors(
             entry.get("model", ""),
             owner=owner,
             require_exact_model=require_exact_model,
+            required_model_type=required_model_type,
         )
         if not resolved:
             continue

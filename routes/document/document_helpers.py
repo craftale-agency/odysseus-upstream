@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from core.database import Document, DocumentVersion
 from core.database import Session as DbSession
 from src.auth_helpers import _auth_disabled
-from src.storage_backend import is_s3_uri
+from src.path_confinement import is_inside
 from src.upload_handler import UploadHandler
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,8 @@ class DocumentPatch(BaseModel):
     title: Optional[str] = None
     language: Optional[str] = None
     session_id: Optional[str] = None  # link/unlink document to a session
+    if_untitled: Optional[bool] = False
+    expected_title: Optional[str] = None
 
 
 # ---- Helpers ----
@@ -137,12 +139,7 @@ _PDF_RENDER_SCALE = 2.0
 
 
 def _upload_path_inside(upload_dir: str, path: str) -> bool:
-    base = os.path.realpath(upload_dir)
-    p = os.path.realpath(path)
-    try:
-        return os.path.commonpath([base, p]) == base
-    except Exception:
-        return False
+    return is_inside(upload_dir, path)
 
 
 def _resolve_user_upload_path(
@@ -162,12 +159,6 @@ def _resolve_user_upload_path(
     if not isinstance(resolved, dict) or not resolved:
         return None
     path = resolved.get("path")
-    if is_s3_uri(path):
-        # Object-stored upload (ODYSSEUS_STORAGE_BACKEND=s3 row): ownership
-        # was already enforced by resolve_upload; the URI is returned as-is
-        # and downstream readers (e.g. document_processor._process_pdf)
-        # handle the s3:// form.
-        return path
     upload_dir = getattr(upload_handler, "upload_dir", None)
     if path and upload_dir and not _upload_path_inside(upload_dir, path):
         logger.warning("Upload path outside upload directory: %s", path)

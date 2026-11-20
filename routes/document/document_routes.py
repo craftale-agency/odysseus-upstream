@@ -1,21 +1,22 @@
 """Document routes — CRUD for living documents with version history."""
 
-import os
 import uuid
 import logging
-import tempfile
-from contextlib import contextmanager
+import os
+import re
+import asyncio
 from datetime import datetime, timezone
-from typing import Dict, Any, Iterator, List, Optional
+from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Form
+from fastapi.responses import HTMLResponse
 
 from sqlalchemy import case, func, or_
 from core.database import SessionLocal, Document, DocumentVersion
 from core.database import Session as DbSession
 from src.auth_helpers import get_current_user, _auth_disabled
 from src.constants import MAIL_ATTACHMENTS_DIR
-from src.storage_backend import is_s3_uri, read_attachment_bytes
+from src.session_search import _escape_like
 from src.upload_handler import reserve_upload_references
 
 logger = logging.getLogger(__name__)
@@ -80,57 +81,6 @@ from routes.document_helpers import (
 )
 
 
-@contextmanager
-def _null_materialized_upload() -> Iterator[Optional[str]]:
-    """Placeholder used when routes run without an upload handler."""
-    yield None
-
-
-@contextmanager
-def _materialized_upload(
-    upload_handler,
-    request: Request,
-    upload_id: str,
-    user: Optional[str],
-) -> Iterator[Optional[str]]:
-    """Yield a LOCAL filesystem path for an upload the caller may read.
-
-    The PDF routes feed pdf_path to helpers that need real files
-    (fitz.open, pypdf). Object-stored rows
-    (ODYSSEUS_STORAGE_BACKEND=s3) are owner-resolved exactly like local
-    rows (via _resolve_user_upload_path, which also gates the s3 URI to
-    the managed bucket) and then downloaded once into a temp file whose
-    suffix keeps the object's extension, so format sniffing keeps
-    working. The temp file is removed on exit — including on exceptions
-    and early returns. Local rows yield their resolved path unchanged
-    (zero new I/O). Yields None when the upload cannot be resolved;
-    callers map that to their existing 404s. Field sidecars do NOT rely
-    on this copy: routes resolve the stored row path separately
-    (_stored_upload_path) so s3 schemas live in companion objects.
-    """
-    auth_manager = getattr(getattr(request, "app", None), "state", None)
-    auth_manager = getattr(auth_manager, "auth_manager", None)
-    resolved = _resolve_user_upload_path(upload_handler, upload_id, user, auth_manager)
-    if not resolved:
-        yield None
-        return
-    if not is_s3_uri(resolved):
-        yield resolved
-        return
-    suffix = os.path.splitext(resolved)[1] or ""
-    fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="odysseus-pdf-")
-    try:
-        with os.fdopen(fd, "wb") as tmp_file:
-            tmp_file.write(read_attachment_bytes({"path": resolved}))
-        logger.info("Materialized object-stored upload %s to %s", resolved, tmp_path)
-        yield tmp_path
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-
 def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
     router = APIRouter(tags=["documents"])
 
@@ -142,35 +92,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 f"Referenced upload is no longer available: {missing_id}",
             )
 
-    def _materialized_user_upload(request: Request, upload_id: str, user: Optional[str]):
-        """Owner-resolve an upload to a LOCAL path (s3 rows materialized).
-
-        Replaces the old bare _locate_current_user_upload at the PDF call
-        sites: object-stored sources are downloaded to a temp file so
-        fitz/pypdf keep working, and the file is cleaned up when the
-        route's `with` block exits. (Field sidecars no longer need the
-        local copy: see _stored_upload_path — s3 rows keep their schema in
-        a companion object next to the PDF in the bucket.)
-        """
-        if upload_handler is None:
-            return _null_materialized_upload()
-        return _materialized_upload(upload_handler, request, upload_id, user)
-
-    def _stored_upload_path(request: Request, upload_id: str, user: Optional[str]) -> Optional[str]:
-        """The uploads.json row's STORED path for an upload (owner-checked).
-
-        Local rows -> the absolute filesystem path (identical to the
-        materialized one); object-stored rows -> the s3://bucket/key URI.
-        Field-sidecar save/load take THIS so the schema lands next to the
-        real bytes: a local file for local rows, a companion object for
-        s3 rows (src/pdf_form_doc.py) — never next to the materialized
-        /tmp copy, which is deleted on route exit. Falls back to None when
-        the row cannot be resolved; callers then degrade as today.
-        """
+    def _locate_current_user_upload(request: Request, upload_id: str, user: Optional[str]):
         if upload_handler is None:
             return None
-        auth_manager = getattr(getattr(request, "app", None), "state", None)
-        auth_manager = getattr(auth_manager, "auth_manager", None)
+        auth_manager = getattr(getattr(request.app, "state", None), "auth_manager", None)
         return _resolve_user_upload_path(upload_handler, upload_id, user, auth_manager)
 
     def _load_pdf_viewer_fitz():
@@ -346,75 +271,242 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             raise HTTPException(500, f"Upload failed: {e}")
 
         upload_id = meta["id"]
-        with _materialized_user_upload(request, upload_id, user) as pdf_path:
-            if not pdf_path:
-                raise HTTPException(500, "Saved PDF could not be located")
+        pdf_path = _locate_current_user_upload(request, upload_id, user)
+        if not pdf_path:
+            raise HTTPException(500, "Saved PDF could not be located")
 
-            title = os.path.splitext(meta.get("original_name") or meta.get("name") or upload_id)[0]
-            try:
-                body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user))
-            except Exception:
-                body_text = None
+        title = os.path.splitext(meta.get("original_name") or meta.get("name") or upload_id)[0]
+        try:
+            body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user))
+        except Exception:
+            body_text = None
 
-            is_form = False
-            try:
-                is_form = has_form_fields(pdf_path)
-            except Exception as e:
-                logger.warning(f"has_form_fields failed for {pdf_path}: {e}")
+        is_form = False
+        try:
+            is_form = has_form_fields(pdf_path)
+        except Exception as e:
+            logger.warning(f"has_form_fields failed for {pdf_path}: {e}")
 
-            if is_form:
-                # Extraction runs on third-party PDFs: an unexpected fitz
-                # error must not escape the route (raw 500 + no doc). Degrade
-                # to the plain-PDF document instead — the user still gets
-                # the import, without the form overlays.
-                try:
-                    fields = extract_fields(pdf_path)
-                except Exception as e:
-                    logger.warning(f"extract_fields failed for {pdf_path}: {e}")
-                    fields = []
-                if fields:
-                    stored_path = _stored_upload_path(request, upload_id, user) or pdf_path
-                    save_field_sidecar(stored_path, fields)
-                    doc_id = create_form_markdown_document(
-                        session_id=session_id,
-                        fields=fields,
-                        upload_id=upload_id,
-                        title=title,
-                        intro_text=body_text,
-                    )
-                else:
-                    doc_id = create_plain_pdf_document(
-                        session_id=session_id,
-                        upload_id=upload_id,
-                        title=title,
-                        body_text=body_text,
-                    )
-            else:
-                doc_id = create_plain_pdf_document(
-                    session_id=session_id,
-                    upload_id=upload_id,
-                    title=title,
-                    body_text=body_text,
-                )
+        if is_form:
+            fields = extract_fields(pdf_path)
+            save_field_sidecar(pdf_path, fields)
+            doc_id = create_form_markdown_document(
+                session_id=session_id,
+                fields=fields,
+                upload_id=upload_id,
+                title=title,
+                intro_text=body_text,
+            )
+        else:
+            doc_id = create_plain_pdf_document(
+                session_id=session_id,
+                upload_id=upload_id,
+                title=title,
+                body_text=body_text,
+            )
 
-            if not doc_id:
-                raise HTTPException(500, "Failed to create document for PDF")
+        if not doc_id:
+            raise HTTPException(500, "Failed to create document for PDF")
 
+        db = SessionLocal()
+        try:
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            if not doc:
+                raise HTTPException(500, "Created document not found")
+            # The PDF doc creators stamp owner from the session only; a
+            # session-less library import leaves owner NULL, which the Library's
+            # owner filter then hides. Stamp the requesting user so it shows.
+            if not doc.owner and user:
+                doc.owner = user
+                db.commit()
+                db.refresh(doc)
+            return _doc_to_dict(doc)
+        finally:
+            db.close()
+
+    # ---- POST /api/documents/import-docx ----
+    @router.post("/api/documents/import-docx")
+    async def import_docx(
+        request: Request,
+        file: UploadFile = File(...),
+        session_id: Optional[str] = Form(None),
+    ) -> Dict[str, Any]:
+        """Import a Word document while preserving its original DOCX upload.
+
+        The extracted Markdown remains available to the agent/editor, while
+        the source marker lets the document viewer render a faithful white
+        paper preview through Mammoth.
+        """
+        from src.auth_helpers import require_privilege
+        from src.markitdown_runtime import convert_to_markdown
+        from src.office_doc import create_office_document
+
+        user = require_privilege(request, "can_use_documents")
+        if session_id:
             db = SessionLocal()
             try:
-                doc = db.query(Document).filter(Document.id == doc_id).first()
-                if not doc:
-                    raise HTTPException(500, "Created document not found")
-                # The PDF doc creators stamp owner from the session only; a
-                # session-less library import leaves owner NULL, which the Library's
-                # owner filter then hides. Stamp the requesting user so it shows.
-                if not doc.owner and user:
-                    doc.owner = user
-                    db.commit()
-                    db.refresh(doc)
-                return _doc_to_dict(doc)
+                _get_session_or_404(db, session_id, user)
             finally:
                 db.close()
+        if upload_handler is None:
+            raise HTTPException(500, "Upload handler not configured")
+
+        client_ip = request.client.host if request.client else "unknown"
+        try:
+            meta = upload_handler.save_upload(file, client_ip, owner=user)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("DOCX import save_upload failed: %s", exc)
+            raise HTTPException(500, f"Upload failed: {exc}") from exc
+
+        upload_id = meta["id"]
+        path = _locate_current_user_upload(request, upload_id, user)
+        if not path:
+            raise HTTPException(500, "Saved DOCX could not be located")
+        try:
+            extracted = await asyncio.to_thread(convert_to_markdown, path) or ""
+        except Exception as exc:
+            logger.warning("DOCX text extraction failed for %s: %s", path, exc)
+            extracted = ""
+        if not extracted.strip():
+            raise HTTPException(422, "Could not extract readable text from this DOCX")
+
+        title = os.path.splitext(meta.get("original_name") or meta.get("name") or upload_id)[0]
+        content = f'<!-- docx_source upload_id="{upload_id}" -->\n{extracted}'
+        doc_id = create_office_document(
+            session_id=session_id,
+            upload_id=upload_id,
+            title=title,
+            body_text=content,
+            language="docx",
+            owner=user,
+        )
+        if not doc_id:
+            raise HTTPException(500, "Failed to create DOCX document")
+
+        db = SessionLocal()
+        try:
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            if not doc:
+                raise HTTPException(500, "Created DOCX document not found")
+            if not doc.owner and user:
+                doc.owner = user
+                db.commit()
+                db.refresh(doc)
+            return _doc_to_dict(doc)
+        finally:
+            db.close()
+
+    @router.get("/api/document/{doc_id}/render-docx")
+    async def render_docx(doc_id: str, request: Request) -> Dict[str, Any]:
+        """Return a sanitized-by-client DOCX-to-HTML preview fragment."""
+        from src.auth_helpers import require_privilege
+
+        user = require_privilege(request, "can_use_documents")
+        db = SessionLocal()
+        try:
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            if not doc:
+                raise HTTPException(404, "Document not found")
+            _verify_doc_owner(db, doc, user)
+            match = re.search(r'<!--\s*docx_source\s+upload_id="([^"]+)"\s*-->', doc.current_content or "")
+            if not match:
+                raise HTTPException(400, "Document has no DOCX source")
+            path = _locate_current_user_upload(request, match.group(1), user)
+            if not path:
+                raise HTTPException(404, "Original DOCX upload is no longer available")
+            try:
+                import mammoth
+                result = await asyncio.to_thread(mammoth.convert_to_html, str(path))
+            except ImportError as exc:
+                raise HTTPException(503, "DOCX preview needs the Mammoth document dependency") from exc
+            except Exception as exc:
+                logger.warning("DOCX preview failed for %s: %s", doc_id, exc)
+                raise HTTPException(422, "Could not render this DOCX preview") from exc
+            return {"html": result.value or "", "messages": [str(m) for m in (result.messages or [])]}
+        finally:
+            db.close()
+
+    @router.get("/api/document/{doc_id}/convert-original/{target}")
+    async def convert_original_document(doc_id: str, target: str, request: Request):
+        """Convert the preserved DOCX/PDF upload directly with LibreOffice.
+
+        The extracted Markdown is for search and AI context only. It must not
+        be used as an intermediate for format conversion because that loses
+        the original document's layout, tables, and page breaks.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from fastapi.responses import Response
+        from src.auth_helpers import require_privilege
+        from src.pdf_form_doc import find_source_upload_id
+
+        if target not in {"pdf", "docx"}:
+            raise HTTPException(400, "Unsupported conversion target")
+
+        user = require_privilege(request, "can_use_documents")
+        db = SessionLocal()
+        try:
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            if not doc:
+                raise HTTPException(404, "Document not found")
+            _verify_doc_owner(db, doc, user)
+            content = doc.current_content or ""
+            match = re.search(
+                r'<!--\s*(?:docx|pdf(?:_form)?)_source\s+upload_id="([^"\s]+)"\s*-->',
+                content,
+                re.IGNORECASE,
+            )
+            upload_id = find_source_upload_id(content) or (match.group(1) if match else None)
+            if not upload_id:
+                raise HTTPException(400, "This document has no preserved original file")
+        finally:
+            db.close()
+
+        source = _locate_current_user_upload(request, upload_id, user)
+        if not source:
+            raise HTTPException(404, "Original upload not found")
+        source = Path(source)
+        source_ext = source.suffix.lower()
+        if target == "pdf" and source_ext != ".docx":
+            raise HTTPException(400, "Only DOCX documents can be converted to PDF")
+        if target == "docx" and source_ext != ".pdf":
+            raise HTTPException(400, "Only PDF documents can be converted to DOCX")
+
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        if not soffice:
+            raise HTTPException(503, "Direct conversion requires LibreOffice/soffice on the Odysseus host")
+
+        def convert():
+            # Keep cleanup in the worker too: request cancellation must not
+            # delete files while LibreOffice is still writing them.
+            with tempfile.TemporaryDirectory(prefix="odysseus-document-convert-") as temp:
+                tmp_dir = Path(temp)
+                try:
+                    proc = subprocess.run(
+                        [soffice, f"-env:UserInstallation={(tmp_dir / 'profile').as_uri()}",
+                         "--headless", "--convert-to", target, "--outdir", str(tmp_dir), str(source)],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, timeout=120, check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise HTTPException(504, "Document conversion timed out") from exc
+                output = tmp_dir / f"{source.stem}.{target}"
+                if proc.returncode != 0 or not output.exists() or output.stat().st_size == 0:
+                    raise HTTPException(502, "LibreOffice could not convert the original file")
+                return output.read_bytes()
+
+        payload = await asyncio.to_thread(convert)
+
+        media = "application/pdf" if target == "pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        return Response(
+            content=payload,
+            media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{source.stem}.{target}"'},
+        )
 
     # ---- GET /api/documents/library ----
     @router.get("/api/documents/library")
@@ -480,9 +572,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             # match docs containing both words regardless of position/order.
             if search:
                 for tok in search.split():
-                    term = f"%{tok}%"
+                    term = f"%{_escape_like(tok)}%"
                     q = q.filter(
-                        Document.title.ilike(term) | Document.current_content.ilike(term)
+                        Document.title.ilike(term, escape="\\")
+                        | Document.current_content.ilike(term, escape="\\")
                     )
 
             # Language filter. "pdf" is a display language derived from the
@@ -576,6 +669,32 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         finally:
             db.close()
 
+    # ---- GET /api/document/{doc_id}/visual-report ----
+    @router.get("/api/document/{doc_id}/visual-report", response_class=HTMLResponse)
+    async def document_visual_report(request: Request, doc_id: str) -> HTMLResponse:
+        """Render a Markdown document with the same standalone report UI used by Deep Research."""
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            if not doc:
+                raise HTTPException(404, "Document not found")
+            _verify_doc_owner(db, doc, user)
+            if (doc.language or "").lower() != "markdown":
+                raise HTTPException(400, "Visual reports are available for Markdown documents")
+
+            from src.visual_report import generate_visual_report
+
+            html_content = generate_visual_report(
+                question=doc.title or "Document",
+                report_markdown=doc.current_content or "",
+                sources=[],
+                stats={},
+            )
+            return HTMLResponse(content=html_content)
+        finally:
+            db.close()
+
     # ---- POST /api/document/{doc_id}/archive — soft-archive / restore ----
     @router.post("/api/document/{doc_id}/archive")
     async def archive_document(request: Request, doc_id: str, archived: bool = Query(True)) -> Dict[str, Any]:
@@ -619,36 +738,36 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             if not upload_id:
                 raise HTTPException(400, "Document is not a PDF — no pdf_source marker found")
 
-            with _materialized_user_upload(request, upload_id, user) as pdf_path:
-                if not pdf_path:
-                    raise HTTPException(404, "Source PDF could not be located")
+            pdf_path = _locate_current_user_upload(request, upload_id, user)
+            if not pdf_path:
+                raise HTTPException(404, "Source PDF could not be located")
 
-                try:
-                    body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user))
-                except Exception as e:
-                    logger.error(f"extract_pdf_text failed for {pdf_path}: {e}")
-                    raise HTTPException(500, f"Extraction failed: {e}")
+            try:
+                body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user))
+            except Exception as e:
+                logger.error(f"extract_pdf_text failed for {pdf_path}: {e}")
+                raise HTTPException(500, f"Extraction failed: {e}")
 
-                if not body_text:
-                    return {"ok": True, "id": doc_id, "extracted": False, "reason": "No readable content"}
+            if not body_text:
+                return {"ok": True, "id": doc_id, "extracted": False, "reason": "No readable content"}
 
-                # Preserve everything up through the title (front-matter marker +
-                # first H1) and replace the rest with the freshly extracted text.
-                head_re = re.compile(r'^(<!--[^>]+-->\s*\n+#[^\n]*\n+)', re.MULTILINE)
-                head_match = head_re.match(content)
-                head = head_match.group(1) if head_match else (content.splitlines()[0] + "\n\n# " + (doc.title or "PDF") + "\n\n")
-                doc.current_content = head + body_text.strip() + "\n"
-                doc.version_count = (doc.version_count or 1) + 1
-                db.add(DocumentVersion(
-                    id=str(__import__("uuid").uuid4()),
-                    document_id=doc_id,
-                    version_number=doc.version_count,
-                    content=doc.current_content,
-                    summary="PDF text re-extracted (OCR)",
-                    source="ocr",
-                ))
-                db.commit()
-                return {"ok": True, "id": doc_id, "extracted": True, "chars": len(body_text)}
+            # Preserve everything up through the title (front-matter marker +
+            # first H1) and replace the rest with the freshly extracted text.
+            head_re = re.compile(r'^(<!--[^>]+-->\s*\n+#[^\n]*\n+)', re.MULTILINE)
+            head_match = head_re.match(content)
+            head = head_match.group(1) if head_match else (content.splitlines()[0] + "\n\n# " + (doc.title or "PDF") + "\n\n")
+            doc.current_content = head + body_text.strip() + "\n"
+            doc.version_count = (doc.version_count or 1) + 1
+            db.add(DocumentVersion(
+                id=str(__import__("uuid").uuid4()),
+                document_id=doc_id,
+                version_number=doc.version_count,
+                content=doc.current_content,
+                summary="PDF text re-extracted (OCR)",
+                source="ocr",
+            ))
+            db.commit()
+            return {"ok": True, "id": doc_id, "extracted": True, "chars": len(body_text)}
         finally:
             db.close()
 
@@ -664,15 +783,17 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         except Exception as e:
             logger.warning("Failed to parse export request body, defaulting to empty", exc_info=e)
             data = {}
-        ids = data.get("ids") or []
+        ids = data.get("ids") if isinstance(data, dict) else None
         if not ids:
             raise HTTPException(400, "No documents specified")
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise HTTPException(400, "ids must be a list of document ids")
         _ext = {
             "javascript": ".js", "python": ".py", "html": ".html", "css": ".css",
             "markdown": ".md", "json": ".json", "yaml": ".yml", "bash": ".sh",
             "sql": ".sql", "rust": ".rs", "go": ".go", "java": ".java", "c": ".c",
             "cpp": ".cpp", "typescript": ".ts", "ruby": ".rb", "php": ".php",
-            "text": ".txt", "xml": ".xml", "toml": ".toml", "ini": ".ini",
+            "text": ".txt", "email": ".eml", "xml": ".xml", "toml": ".toml", "ini": ".ini",
         }
         db = SessionLocal()
         try:
@@ -693,13 +814,19 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                     ext = _ext.get(doc.language or "text", ".txt")
                     base = (doc.title or "document").strip() or "document"
                     base = re.sub(r"[^\w\-. ]+", "", base)[:60].strip() or doc.id
-                    name = base if "." in base else base + ext
+                    has_ext = base.lower().endswith(ext)
+                    stem = base[:-len(ext)] if has_ext else base
+                    suffix = base[-len(ext):] if has_ext else ext
+                    name = stem + suffix
                     i = 1
                     while name in used:
-                        name = f"{base}-{i}" + ("" if "." in base else ext)
+                        name = f"{stem}-{i}{suffix}"
                         i += 1
                     used.add(name)
-                    zf.writestr(name, doc.current_content or "")
+                    content = doc.current_content or ""
+                    if (doc.language or "").lower() == "email":
+                        content = re.sub(r"\r?\n---\r?\n", "\r\n\r\n", content, count=1)
+                    zf.writestr(name, content)
                     wrote += 1
             if not wrote:
                 raise HTTPException(404, "No documents found")
@@ -802,7 +929,52 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 raise HTTPException(404, "Document not found")
             _verify_doc_owner(db, doc, user)
             if req.title is not None:
-                doc.title = req.title
+                normalized_title = req.title.strip()
+                if req.if_untitled:
+                    updated = (
+                        db.query(Document)
+                        .filter(
+                            Document.id == doc_id,
+                            or_(
+                                Document.title == "Untitled",
+                                Document.title.is_(None),
+                                Document.title == "",
+                            ),
+                        )
+                        .update({"title": normalized_title}, synchronize_session=False)
+                    )
+                    if updated == 0:
+                        raise HTTPException(409, "Document title condition not met: document is not untitled")
+                    doc.title = normalized_title
+                elif req.expected_title is not None:
+                    expected_val = req.expected_title.strip()
+                    if expected_val in ("Untitled", "", None):
+                        updated = (
+                            db.query(Document)
+                            .filter(
+                                Document.id == doc_id,
+                                or_(
+                                    Document.title == "Untitled",
+                                    Document.title.is_(None),
+                                    Document.title == "",
+                                ),
+                            )
+                            .update({"title": normalized_title}, synchronize_session=False)
+                        )
+                    else:
+                        updated = (
+                            db.query(Document)
+                            .filter(
+                                Document.id == doc_id,
+                                Document.title == req.expected_title,
+                            )
+                            .update({"title": normalized_title}, synchronize_session=False)
+                        )
+                    if updated == 0:
+                        raise HTTPException(409, f"Document title condition not met: expected {req.expected_title!r}")
+                    doc.title = normalized_title
+                else:
+                    doc.title = normalized_title
             if req.language is not None:
                 doc.language = req.language
             if req.session_id is not None:
@@ -1065,7 +1237,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
     async def ai_tidy_documents(request: Request) -> Dict[str, Any]:
         """Use AI to judge if documents are junk/test/accidental, then delete them.
         Caches verdicts so previously-reviewed docs are skipped."""
-        from src.task_endpoint import resolve_task_endpoint
+        from src.task_endpoint import resolve_task_endpoint, task_llm_call_async
         from src.endpoint_resolver import resolve_endpoint
         from src.llm_core import llm_call_async
 
@@ -1108,13 +1280,13 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 + "\n".join(doc_list)
             )
 
-            response = await llm_call_async(
-                url, model,
+            response = await task_llm_call_async(
                 [{"role": "system", "content": "You classify documents as junk or keep. Respond only with a JSON array."},
                  {"role": "user", "content": prompt}],
+                fallback_url=url, fallback_model=model, fallback_headers=headers,
+                owner=user or None,
                 temperature=0.1,
                 max_tokens=200,
-                headers=headers,
                 timeout=30,
             )
 
@@ -1179,45 +1351,43 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             if not upload_id:
                 raise HTTPException(400, "Document is not linked to a source PDF")
 
-            with _materialized_user_upload(request, upload_id, user) as pdf_path:
-                if not pdf_path:
-                    raise HTTPException(404, f"Source PDF {upload_id} not found in uploads")
+            pdf_path = _locate_current_user_upload(request, upload_id, user)
+            if not pdf_path:
+                raise HTTPException(404, f"Source PDF {upload_id} not found in uploads")
 
-                fields = load_field_sidecar(
-                    _stored_upload_path(request, upload_id, user) or pdf_path
-                )
-                if not fields:
-                    raise HTTPException(404, "Field schema sidecar missing for source PDF")
+            fields = load_field_sidecar(pdf_path)
+            if not fields:
+                raise HTTPException(404, "Field schema sidecar missing for source PDF")
 
-                values = parse_markdown_to_values(doc.current_content or "")
-                field_meta = {f["name"]: f for f in fields}
+            values = parse_markdown_to_values(doc.current_content or "")
+            field_meta = {f["name"]: f for f in fields}
 
-                preview = []
-                for name, current in values.items():
-                    meta = field_meta.get(name)
-                    if not meta:
-                        continue
-                    preview.append({
-                        "name": name,
-                        "label": meta.get("label") or name,
-                        "type": meta.get("type"),
-                        "options": meta.get("options") or [],
-                        "page": meta.get("page"),
-                        "value": current,
-                    })
+            preview = []
+            for name, current in values.items():
+                meta = field_meta.get(name)
+                if not meta:
+                    continue
+                preview.append({
+                    "name": name,
+                    "label": meta.get("label") or name,
+                    "type": meta.get("type"),
+                    "options": meta.get("options") or [],
+                    "page": meta.get("page"),
+                    "value": current,
+                })
 
-                unknown = [
-                    name for name in values
-                    if name not in field_meta
-                ]
-                return {
-                    "doc_id": doc_id,
-                    "upload_id": upload_id,
-                    "fields": preview,
-                    "unknown_fields": unknown,
-                    "total": len(fields),
-                    "filled": sum(1 for p in preview if p["value"] not in ("", False, None)),
-                }
+            unknown = [
+                name for name in values
+                if name not in field_meta
+            ]
+            return {
+                "doc_id": doc_id,
+                "upload_id": upload_id,
+                "fields": preview,
+                "unknown_fields": unknown,
+                "total": len(fields),
+                "filled": sum(1 for p in preview if p["value"] not in ("", False, None)),
+            }
         finally:
             db.close()
 
@@ -1243,54 +1413,52 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             upload_id = find_source_upload_id(doc.current_content or "")
             if not upload_id:
                 raise HTTPException(400, "Document is not linked to a source PDF")
-            with _materialized_user_upload(request, upload_id, user) as pdf_path:
-                if not pdf_path:
-                    raise HTTPException(404, f"Source PDF {upload_id} not found")
+            pdf_path = _locate_current_user_upload(request, upload_id, user)
+            if not pdf_path:
+                raise HTTPException(404, f"Source PDF {upload_id} not found")
 
-                fitz = _load_pdf_viewer_fitz()
-                schema = load_field_sidecar(
-                    _stored_upload_path(request, upload_id, user) or pdf_path
-                ) or []
-                values = parse_markdown_to_values(doc.current_content or "")
+            fitz = _load_pdf_viewer_fitz()
+            schema = load_field_sidecar(pdf_path) or []
+            values = parse_markdown_to_values(doc.current_content or "")
 
-                # Group fields by page
-                by_page: Dict[int, list] = {}
-                for f in schema:
-                    by_page.setdefault(f["page"], []).append(f)
+            # Group fields by page
+            by_page: Dict[int, list] = {}
+            for f in schema:
+                by_page.setdefault(f["page"], []).append(f)
 
-                scale = _PDF_RENDER_SCALE
-                pdf_doc = fitz.open(pdf_path)
-                try:
-                    pages_out = []
-                    for page_index in range(pdf_doc.page_count):
-                        page = pdf_doc[page_index]
-                        page_no = page_index + 1
-                        pw, ph = page.rect.width, page.rect.height
-                        img_w = int(pw * scale)
-                        img_h = int(ph * scale)
-                        fields_out = []
-                        for f in by_page.get(page_no, []):
-                            x0, y0, x1, y1 = f["rect"]
-                            fields_out.append({
-                                "name": f["name"],
-                                "type": f["type"],
-                                "label": f.get("label") or "",
-                                "options": f.get("options") or [],
-                                "value": values.get(f["name"], f.get("value", "")),
-                                "rect_px": [
-                                    int(x0 * scale), int(y0 * scale),
-                                    int(x1 * scale), int(y1 * scale),
-                                ],
-                            })
-                        pages_out.append({
-                            "page": page_no,
-                            "width": img_w,
-                            "height": img_h,
-                            "fields": fields_out,
+            scale = _PDF_RENDER_SCALE
+            pdf_doc = fitz.open(pdf_path)
+            try:
+                pages_out = []
+                for page_index in range(pdf_doc.page_count):
+                    page = pdf_doc[page_index]
+                    page_no = page_index + 1
+                    pw, ph = page.rect.width, page.rect.height
+                    img_w = int(pw * scale)
+                    img_h = int(ph * scale)
+                    fields_out = []
+                    for f in by_page.get(page_no, []):
+                        x0, y0, x1, y1 = f["rect"]
+                        fields_out.append({
+                            "name": f["name"],
+                            "type": f["type"],
+                            "label": f.get("label") or "",
+                            "options": f.get("options") or [],
+                            "value": values.get(f["name"], f.get("value", "")),
+                            "rect_px": [
+                                int(x0 * scale), int(y0 * scale),
+                                int(x1 * scale), int(y1 * scale),
+                            ],
                         })
-                    return {"doc_id": doc_id, "scale": scale, "pages": pages_out}
-                finally:
-                    pdf_doc.close()
+                    pages_out.append({
+                        "page": page_no,
+                        "width": img_w,
+                        "height": img_h,
+                        "fields": fields_out,
+                    })
+                return {"doc_id": doc_id, "scale": scale, "pages": pages_out}
+            finally:
+                pdf_doc.close()
         finally:
             db.close()
 
@@ -1312,28 +1480,28 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             upload_id = find_source_upload_id(doc.current_content or "")
             if not upload_id:
                 raise HTTPException(400, "Document is not linked to a source PDF")
+            pdf_path = _locate_current_user_upload(request, upload_id, user)
+            if not pdf_path:
+                raise HTTPException(404, "Source PDF not found")
         finally:
             db.close()
 
-        with _materialized_user_upload(request, upload_id, user) as pdf_path:
-            if not pdf_path:
-                raise HTTPException(404, "Source PDF not found")
-            fitz = _load_pdf_viewer_fitz()
-            pdf_doc = fitz.open(pdf_path)
-            try:
-                if page_no < 1 or page_no > pdf_doc.page_count:
-                    raise HTTPException(404, "Page out of range")
-                page = pdf_doc[page_no - 1]
-                mat = fitz.Matrix(_PDF_RENDER_SCALE, _PDF_RENDER_SCALE)
-                pix = page.get_pixmap(matrix=mat, alpha=False)
-                png_bytes = pix.tobytes("png")
-                return Response(
-                    content=png_bytes,
-                    media_type="image/png",
-                    headers={"Cache-Control": "public, max-age=3600"},
-                )
-            finally:
-                pdf_doc.close()
+        fitz = _load_pdf_viewer_fitz()
+        pdf_doc = fitz.open(pdf_path)
+        try:
+            if page_no < 1 or page_no > pdf_doc.page_count:
+                raise HTTPException(404, "Page out of range")
+            page = pdf_doc[page_no - 1]
+            mat = fitz.Matrix(_PDF_RENDER_SCALE, _PDF_RENDER_SCALE)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            png_bytes = pix.tobytes("png")
+            return Response(
+                content=png_bytes,
+                media_type="image/png",
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+        finally:
+            pdf_doc.close()
 
     # ---- POST /api/document/{doc_id}/ai-fill-annotations ----
     @router.post("/api/document/{doc_id}/ai-fill-annotations")
@@ -1367,113 +1535,113 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             upload_id = find_source_upload_id(doc.current_content or "")
             if not upload_id:
                 raise HTTPException(400, "Document is not linked to a source PDF")
+            pdf_path = _locate_current_user_upload(request, upload_id, user)
+            if not pdf_path:
+                raise HTTPException(404, "Source PDF not found")
         finally:
             db.close()
 
-        with _materialized_user_upload(request, upload_id, user) as pdf_path:
-            if not pdf_path:
-                raise HTTPException(404, "Source PDF not found")
-            # Resolve VL model (admin-configured or auto-detected vision-capable)
-            settings = _load_vl_settings()
-            vl_model = settings.get("vision_model", "")
-            try:
-                url, model_id, headers = _resolve_vl_model(vl_model, owner=user)
-            except Exception as e:
-                raise HTTPException(503, f"No vision model available: {e}")
+        # Resolve VL model (admin-configured or auto-detected vision-capable)
+        settings = _load_vl_settings()
+        vl_model = settings.get("vision_model", "")
+        try:
+            url, model_id, headers = _resolve_vl_model(vl_model, owner=user)
+        except Exception as e:
+            raise HTTPException(503, f"No vision model available: {e}")
 
-            system_prompt = (
-                "You analyze rendered PDF page images and propose values to fill in. "
-                "For each blank line, box, underscore, or labeled space on the page that "
-                "should be filled given the user's instruction, output one annotation. "
-                "Coordinates are percentages (0-100) of the page width/height with the "
-                "origin at top-left. Width/height should match the visible blank box. "
-                "Return ONLY a JSON array, no prose, no markdown fences. Each entry: "
-                '{"x": number, "y": number, "w": number, "h": number, "value": string}. '
-                "If a region should not be filled, omit it. If nothing should be filled, "
-                "return []."
-            )
+        system_prompt = (
+            "You analyze rendered PDF page images and propose values to fill in. "
+            "For each blank line, box, underscore, or labeled space on the page that "
+            "should be filled given the user's instruction, output one annotation. "
+            "Coordinates are percentages (0-100) of the page width/height with the "
+            "origin at top-left. Width/height should match the visible blank box. "
+            "Return ONLY a JSON array, no prose, no markdown fences. Each entry: "
+            '{"x": number, "y": number, "w": number, "h": number, "value": string}. '
+            "If a region should not be filled, omit it. If nothing should be filled, "
+            "return []."
+        )
 
-            all_annotations = []
-            pdf_doc = fitz.open(pdf_path)
-            try:
-                for page_index in range(pdf_doc.page_count):
-                    page = pdf_doc[page_index]
-                    mat = fitz.Matrix(_PDF_RENDER_SCALE, _PDF_RENDER_SCALE)
-                    pix = page.get_pixmap(matrix=mat, alpha=False)
-                    png_bytes = pix.tobytes("png")
-                    b64 = base64.b64encode(png_bytes).decode("ascii")
+        all_annotations = []
+        pdf_doc = fitz.open(pdf_path)
+        try:
+            for page_index in range(pdf_doc.page_count):
+                page = pdf_doc[page_index]
+                mat = fitz.Matrix(_PDF_RENDER_SCALE, _PDF_RENDER_SCALE)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                png_bytes = pix.tobytes("png")
+                b64 = base64.b64encode(png_bytes).decode("ascii")
 
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        f"User instruction:\n{instruction}\n\n"
-                                        f"This is page {page_index + 1} of {pdf_doc.page_count}. "
-                                        "Return JSON array of annotations to add to this page."
-                                    ),
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/png;base64,{b64}"},
-                                },
-                            ],
-                        },
-                    ]
-                    try:
-                        raw = await llm_call_async(
-                            url, model_id, messages,
-                            temperature=0.1, max_tokens=2000, headers=headers,
-                        )
-                    except Exception as e:
-                        logger.error(f"VL call failed on page {page_index + 1}: {e}")
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"User instruction:\n{instruction}\n\n"
+                                    f"This is page {page_index + 1} of {pdf_doc.page_count}. "
+                                    "Return JSON array of annotations to add to this page."
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                            },
+                        ],
+                    },
+                ]
+                try:
+                    raw = await llm_call_async(
+                        url, model_id, messages,
+                        temperature=0.1, max_tokens=2000, headers=headers,
+                    )
+                except Exception as e:
+                    logger.error(f"VL call failed on page {page_index + 1}: {e}")
+                    continue
+
+                raw = (raw or "").strip()
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    logger.warning(f"AI fill: page {page_index + 1} returned non-JSON: {raw[:200]}")
+                    continue
+                if not isinstance(parsed, list):
+                    continue
+                for item in parsed:
+                    if not isinstance(item, dict):
                         continue
-
-                    raw = (raw or "").strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
                     try:
-                        parsed = json.loads(raw)
+                        x = float(item.get("x", 0))
+                        y = float(item.get("y", 0))
+                        w = float(item.get("w", 0))
+                        h = float(item.get("h", 0))
+                        value = str(item.get("value", "") or "")
                     except Exception:
-                        logger.warning(f"AI fill: page {page_index + 1} returned non-JSON: {raw[:200]}")
                         continue
-                    if not isinstance(parsed, list):
+                    # Clamp + reject zero-size entries
+                    if w <= 0.5 or h <= 0.3:
                         continue
-                    for item in parsed:
-                        if not isinstance(item, dict):
-                            continue
-                        try:
-                            x = float(item.get("x", 0))
-                            y = float(item.get("y", 0))
-                            w = float(item.get("w", 0))
-                            h = float(item.get("h", 0))
-                            value = str(item.get("value", "") or "")
-                        except Exception:
-                            continue
-                        # Clamp + reject zero-size entries
-                        if w <= 0.5 or h <= 0.3:
-                            continue
-                        x = max(0.0, min(99.0, x))
-                        y = max(0.0, min(99.0, y))
-                        w = max(0.5, min(100.0 - x, w))
-                        h = max(0.3, min(100.0 - y, h))
-                        if not value.strip():
-                            continue
-                        all_annotations.append({
-                            "page": page_index + 1,
-                            "x": round(x, 2),
-                            "y": round(y, 2),
-                            "w": round(w, 2),
-                            "h": round(h, 2),
-                            "value": value,
-                        })
-            finally:
-                pdf_doc.close()
+                    x = max(0.0, min(99.0, x))
+                    y = max(0.0, min(99.0, y))
+                    w = max(0.5, min(100.0 - x, w))
+                    h = max(0.3, min(100.0 - y, h))
+                    if not value.strip():
+                        continue
+                    all_annotations.append({
+                        "page": page_index + 1,
+                        "x": round(x, 2),
+                        "y": round(y, 2),
+                        "w": round(w, 2),
+                        "h": round(h, 2),
+                        "value": value,
+                    })
+        finally:
+            pdf_doc.close()
 
-            return {"annotations": all_annotations}
+        return {"annotations": all_annotations}
 
     # ---- GET /api/document/{doc_id}/render-pdf ----
     @router.get("/api/document/{doc_id}/render-pdf")
@@ -1515,63 +1683,63 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             upload_id = find_source_upload_id(doc.current_content or "")
             if not upload_id:
                 raise HTTPException(400, "Document is not linked to a source PDF")
-            with _materialized_user_upload(request, upload_id, user) as pdf_path:
-                if not pdf_path:
-                    raise HTTPException(404, f"Source PDF {upload_id} not found")
+            pdf_path = _locate_current_user_upload(request, upload_id, user)
+            if not pdf_path:
+                raise HTTPException(404, f"Source PDF {upload_id} not found")
 
-                # Fail fast with a clear 503 if the optional PyMuPDF dependency
-                # is missing — fill_fields/stamp_annotations will otherwise
-                # raise RuntimeError deep inside and bubble out as a 500.
-                # Mirrors the convention in _load_pdf_viewer_fitz above.
-                _load_pdf_viewer_fitz()
+            # Fail fast with a clear 503 if the optional PyMuPDF dependency
+            # is missing — fill_fields/stamp_annotations will otherwise
+            # raise RuntimeError deep inside and bubble out as a 500.
+            # Mirrors the convention in _load_pdf_viewer_fitz above.
+            _load_pdf_viewer_fitz()
 
-                values = parse_markdown_to_values(doc.current_content or "")
-                out_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-                _to_unlink.append(out_path)
+            values = parse_markdown_to_values(doc.current_content or "")
+            out_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+            _to_unlink.append(out_path)
+            try:
+                fill_fields(pdf_path, out_path, values)
+            except Exception as e:
+                logger.error(f"render_pdf fill_fields failed for {doc_id}: {e}")
+                _cleanup_temps()
+                raise HTTPException(500, f"PDF render failed: {e}")
+
+            annotations = parse_markdown_annotations(doc.current_content or "")
+            if annotations:
+                ann_sig_ids = [
+                    a["value"][len("signature:"):].strip()
+                    for a in annotations
+                    if a.get("kind") == "signature"
+                    and isinstance(a.get("value"), str)
+                    and a["value"].startswith("signature:")
+                ]
+                ann_signature_pngs: dict[str, bytes] = {}
+                if ann_sig_ids:
+                    # SECURITY: filter by owner so a caller can't reference
+                    # someone else's signature ID from doc markdown and have
+                    # it stamped/exported.
+                    _sig_q = db.query(Signature).filter(Signature.id.in_(ann_sig_ids))
+                    if user:
+                        _sig_q = _sig_q.filter(Signature.owner == user)
+                    sig_rows = _sig_q.all()
+                    for s in sig_rows:
+                        try:
+                            ann_signature_pngs[s.id] = base64.b64decode(s.data_png)
+                        except Exception as e:
+                            logger.warning(f"Bad annotation signature data for {s.id}: {e}")
+                annotated_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+                _to_unlink.append(annotated_path)
                 try:
-                    fill_fields(pdf_path, out_path, values)
+                    stamp_annotations(out_path, annotated_path, annotations, ann_signature_pngs)
+                    out_path = annotated_path
                 except Exception as e:
-                    logger.error(f"render_pdf fill_fields failed for {doc_id}: {e}")
-                    _cleanup_temps()
-                    raise HTTPException(500, f"PDF render failed: {e}")
+                    logger.error(f"stamp_annotations (render) failed for {doc_id}: {e}")
 
-                annotations = parse_markdown_annotations(doc.current_content or "")
-                if annotations:
-                    ann_sig_ids = [
-                        a["value"][len("signature:"):].strip()
-                        for a in annotations
-                        if a.get("kind") == "signature"
-                        and isinstance(a.get("value"), str)
-                        and a["value"].startswith("signature:")
-                    ]
-                    ann_signature_pngs: dict[str, bytes] = {}
-                    if ann_sig_ids:
-                        # SECURITY: filter by owner so a caller can't reference
-                        # someone else's signature ID from doc markdown and have
-                        # it stamped/exported.
-                        _sig_q = db.query(Signature).filter(Signature.id.in_(ann_sig_ids))
-                        if user:
-                            _sig_q = _sig_q.filter(Signature.owner == user)
-                        sig_rows = _sig_q.all()
-                        for s in sig_rows:
-                            try:
-                                ann_signature_pngs[s.id] = base64.b64decode(s.data_png)
-                            except Exception as e:
-                                logger.warning(f"Bad annotation signature data for {s.id}: {e}")
-                    annotated_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-                    _to_unlink.append(annotated_path)
-                    try:
-                        stamp_annotations(out_path, annotated_path, annotations, ann_signature_pngs)
-                        out_path = annotated_path
-                    except Exception as e:
-                        logger.error(f"stamp_annotations (render) failed for {doc_id}: {e}")
-
-                return FileResponse(
-                    out_path,
-                    media_type="application/pdf",
-                    headers={"Content-Disposition": "inline"},
-                    background=BackgroundTask(_cleanup_temps),
-                )
+            return FileResponse(
+                out_path,
+                media_type="application/pdf",
+                headers={"Content-Disposition": "inline"},
+                background=BackgroundTask(_cleanup_temps),
+            )
         finally:
             db.close()
 
@@ -1615,101 +1783,99 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             if not upload_id:
                 raise HTTPException(400, "Document is not linked to a source PDF")
 
-            with _materialized_user_upload(request, upload_id, user) as pdf_path:
-                if not pdf_path:
-                    raise HTTPException(404, f"Source PDF {upload_id} not found in uploads")
+            pdf_path = _locate_current_user_upload(request, upload_id, user)
+            if not pdf_path:
+                raise HTTPException(404, f"Source PDF {upload_id} not found in uploads")
 
-                schema = load_field_sidecar(
-                    _stored_upload_path(request, upload_id, user) or pdf_path
-                ) or []
-                sig_field_names = {f["name"] for f in schema if f.get("type") == "signature"}
+            schema = load_field_sidecar(pdf_path) or []
+            sig_field_names = {f["name"] for f in schema if f.get("type") == "signature"}
 
-                all_values = parse_markdown_to_values(doc.current_content or "")
-                # Split: signature fields go to stamps, everything else to fill_fields
-                text_values: dict = {}
-                sig_ids: dict[str, str] = {}
-                for name, raw in all_values.items():
-                    if name in sig_field_names and isinstance(raw, str) and raw.startswith("signature:"):
-                        sig_ids[name] = raw[len("signature:"):].strip()
-                    elif name not in sig_field_names:
-                        text_values[name] = raw
+            all_values = parse_markdown_to_values(doc.current_content or "")
+            # Split: signature fields go to stamps, everything else to fill_fields
+            text_values: dict = {}
+            sig_ids: dict[str, str] = {}
+            for name, raw in all_values.items():
+                if name in sig_field_names and isinstance(raw, str) and raw.startswith("signature:"):
+                    sig_ids[name] = raw[len("signature:"):].strip()
+                elif name not in sig_field_names:
+                    text_values[name] = raw
 
-                stamps: dict = {}
-                if sig_ids:
-                    # SECURITY: filter by owner — same reason as render_pdf.
-                    _sig_q2 = db.query(Signature).filter(Signature.id.in_(list(sig_ids.values())))
-                    if user:
-                        _sig_q2 = _sig_q2.filter(Signature.owner == user)
-                    rows = _sig_q2.all()
-                    by_id = {s.id: s for s in rows}
-                    for field_name, sid in sig_ids.items():
-                        s = by_id.get(sid)
-                        if not s:
-                            continue
-                        try:
-                            stamps[field_name] = base64.b64decode(s.data_png)
-                        except Exception as e:
-                            logger.warning(f"Bad signature data for {sid}: {e}")
+            stamps: dict = {}
+            if sig_ids:
+                # SECURITY: filter by owner — same reason as render_pdf.
+                _sig_q2 = db.query(Signature).filter(Signature.id.in_(list(sig_ids.values())))
+                if user:
+                    _sig_q2 = _sig_q2.filter(Signature.owner == user)
+                rows = _sig_q2.all()
+                by_id = {s.id: s for s in rows}
+                for field_name, sid in sig_ids.items():
+                    s = by_id.get(sid)
+                    if not s:
+                        continue
+                    try:
+                        stamps[field_name] = base64.b64decode(s.data_png)
+                    except Exception as e:
+                        logger.warning(f"Bad signature data for {sid}: {e}")
 
-                filled_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-                _to_unlink.append(filled_path)
+            filled_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+            _to_unlink.append(filled_path)
+            try:
+                fill_fields(pdf_path, filled_path, text_values)
+            except Exception as e:
+                logger.error(f"fill_fields failed for doc {doc_id}: {e}")
+                _cleanup_temps()
+                raise HTTPException(500, f"PDF fill failed: {e}")
+
+            out_path = filled_path
+            if stamps:
+                stamped_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+                _to_unlink.append(stamped_path)
                 try:
-                    fill_fields(pdf_path, filled_path, text_values)
+                    stamp_signatures(filled_path, stamped_path, stamps)
+                    out_path = stamped_path
                 except Exception as e:
-                    logger.error(f"fill_fields failed for doc {doc_id}: {e}")
-                    _cleanup_temps()
-                    raise HTTPException(500, f"PDF fill failed: {e}")
+                    logger.error(f"stamp_signatures failed for doc {doc_id}: {e}")
 
-                out_path = filled_path
-                if stamps:
-                    stamped_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-                    _to_unlink.append(stamped_path)
-                    try:
-                        stamp_signatures(filled_path, stamped_path, stamps)
-                        out_path = stamped_path
-                    except Exception as e:
-                        logger.error(f"stamp_signatures failed for doc {doc_id}: {e}")
+            # Burn freeform annotations (Text/Check/Sign drops) on top.
+            annotations = parse_markdown_annotations(doc.current_content or "")
+            if annotations:
+                # Resolve any signature annotations to their PNG bytes.
+                ann_sig_ids = [
+                    a["value"][len("signature:"):].strip()
+                    for a in annotations
+                    if a.get("kind") == "signature"
+                    and isinstance(a.get("value"), str)
+                    and a["value"].startswith("signature:")
+                ]
+                ann_signature_pngs: dict[str, bytes] = {}
+                if ann_sig_ids:
+                    # SECURITY: filter by owner so a caller can't reference
+                    # someone else's signature ID from doc markdown and have
+                    # it stamped/exported.
+                    _sig_q = db.query(Signature).filter(Signature.id.in_(ann_sig_ids))
+                    if user:
+                        _sig_q = _sig_q.filter(Signature.owner == user)
+                    sig_rows = _sig_q.all()
+                    for s in sig_rows:
+                        try:
+                            ann_signature_pngs[s.id] = base64.b64decode(s.data_png)
+                        except Exception as e:
+                            logger.warning(f"Bad annotation signature data for {s.id}: {e}")
+                annotated_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+                _to_unlink.append(annotated_path)
+                try:
+                    stamp_annotations(out_path, annotated_path, annotations, ann_signature_pngs)
+                    out_path = annotated_path
+                except Exception as e:
+                    logger.error(f"stamp_annotations failed for doc {doc_id}: {e}")
 
-                # Burn freeform annotations (Text/Check/Sign drops) on top.
-                annotations = parse_markdown_annotations(doc.current_content or "")
-                if annotations:
-                    # Resolve any signature annotations to their PNG bytes.
-                    ann_sig_ids = [
-                        a["value"][len("signature:"):].strip()
-                        for a in annotations
-                        if a.get("kind") == "signature"
-                        and isinstance(a.get("value"), str)
-                        and a["value"].startswith("signature:")
-                    ]
-                    ann_signature_pngs: dict[str, bytes] = {}
-                    if ann_sig_ids:
-                        # SECURITY: filter by owner so a caller can't reference
-                        # someone else's signature ID from doc markdown and have
-                        # it stamped/exported.
-                        _sig_q = db.query(Signature).filter(Signature.id.in_(ann_sig_ids))
-                        if user:
-                            _sig_q = _sig_q.filter(Signature.owner == user)
-                        sig_rows = _sig_q.all()
-                        for s in sig_rows:
-                            try:
-                                ann_signature_pngs[s.id] = base64.b64decode(s.data_png)
-                            except Exception as e:
-                                logger.warning(f"Bad annotation signature data for {s.id}: {e}")
-                    annotated_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-                    _to_unlink.append(annotated_path)
-                    try:
-                        stamp_annotations(out_path, annotated_path, annotations, ann_signature_pngs)
-                        out_path = annotated_path
-                    except Exception as e:
-                        logger.error(f"stamp_annotations failed for doc {doc_id}: {e}")
-
-                download_name = _slug(doc.title or "form") + "_annotated.pdf"
-                return FileResponse(
-                    out_path,
-                    media_type="application/pdf",
-                    filename=download_name,
-                    background=BackgroundTask(_cleanup_temps),
-                )
+            download_name = _slug(doc.title or "form") + "_annotated.pdf"
+            return FileResponse(
+                out_path,
+                media_type="application/pdf",
+                filename=download_name,
+                background=BackgroundTask(_cleanup_temps),
+            )
         finally:
             db.close()
 
@@ -1757,158 +1923,156 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             upload_id = find_source_upload_id(doc.current_content or "")
             if not upload_id:
                 raise HTTPException(400, "Document is not linked to a source PDF")
-            with _materialized_user_upload(request, upload_id, user) as pdf_path:
-                if not pdf_path:
-                    raise HTTPException(404, f"Source PDF {upload_id} not found")
+            pdf_path = _locate_current_user_upload(request, upload_id, user)
+            if not pdf_path:
+                raise HTTPException(404, f"Source PDF {upload_id} not found")
 
-                schema = load_field_sidecar(
-                    _stored_upload_path(request, upload_id, user) or pdf_path
-                ) or []
-                sig_field_names = {f["name"] for f in schema if f.get("type") == "signature"}
-                all_values = parse_markdown_to_values(doc.current_content or "")
-                text_values: dict = {}
-                sig_ids: dict[str, str] = {}
-                for name, raw in all_values.items():
-                    if name in sig_field_names and isinstance(raw, str) and raw.startswith("signature:"):
-                        sig_ids[name] = raw[len("signature:"):].strip()
-                    elif name not in sig_field_names:
-                        text_values[name] = raw
+            schema = load_field_sidecar(pdf_path) or []
+            sig_field_names = {f["name"] for f in schema if f.get("type") == "signature"}
+            all_values = parse_markdown_to_values(doc.current_content or "")
+            text_values: dict = {}
+            sig_ids: dict[str, str] = {}
+            for name, raw in all_values.items():
+                if name in sig_field_names and isinstance(raw, str) and raw.startswith("signature:"):
+                    sig_ids[name] = raw[len("signature:"):].strip()
+                elif name not in sig_field_names:
+                    text_values[name] = raw
 
-                stamps: dict = {}
-                if sig_ids:
-                    # SECURITY: filter by owner — same reason as render_pdf.
-                    _sig_q2 = db.query(Signature).filter(Signature.id.in_(list(sig_ids.values())))
+            stamps: dict = {}
+            if sig_ids:
+                # SECURITY: filter by owner — same reason as render_pdf.
+                _sig_q2 = db.query(Signature).filter(Signature.id.in_(list(sig_ids.values())))
+                if user:
+                    _sig_q2 = _sig_q2.filter(Signature.owner == user)
+                rows = _sig_q2.all()
+                by_id = {s.id: s for s in rows}
+                for fname, sid in sig_ids.items():
+                    s = by_id.get(sid)
+                    if not s:
+                        continue
+                    try:
+                        stamps[fname] = base64.b64decode(s.data_png)
+                    except Exception:
+                        pass
+
+            import os
+            _to_unlink: list[str] = []
+            filled_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+            _to_unlink.append(filled_path)
+            fill_fields(pdf_path, filled_path, text_values)
+            out_path = filled_path
+            if stamps:
+                stamped_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+                _to_unlink.append(stamped_path)
+                try:
+                    stamp_signatures(filled_path, stamped_path, stamps)
+                    out_path = stamped_path
+                except Exception as e:
+                    logger.warning(f"stamp_signatures failed for {doc_id}: {e}")
+
+            annotations = parse_markdown_annotations(doc.current_content or "")
+            if annotations:
+                ann_sig_ids = [
+                    a["value"][len("signature:"):].strip()
+                    for a in annotations
+                    if a.get("kind") == "signature"
+                    and isinstance(a.get("value"), str)
+                    and a["value"].startswith("signature:")
+                ]
+                ann_signature_pngs: dict[str, bytes] = {}
+                if ann_sig_ids:
+                    # SECURITY: filter by owner so a caller can't reference
+                    # someone else's signature ID from doc markdown and have
+                    # it stamped/exported.
+                    _sig_q = db.query(Signature).filter(Signature.id.in_(ann_sig_ids))
                     if user:
-                        _sig_q2 = _sig_q2.filter(Signature.owner == user)
-                    rows = _sig_q2.all()
-                    by_id = {s.id: s for s in rows}
-                    for fname, sid in sig_ids.items():
-                        s = by_id.get(sid)
-                        if not s:
-                            continue
+                        _sig_q = _sig_q.filter(Signature.owner == user)
+                    sig_rows = _sig_q.all()
+                    for s in sig_rows:
                         try:
-                            stamps[fname] = base64.b64decode(s.data_png)
+                            ann_signature_pngs[s.id] = base64.b64decode(s.data_png)
                         except Exception:
                             pass
-
-                import os
-                _to_unlink: list[str] = []
-                filled_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-                _to_unlink.append(filled_path)
-                fill_fields(pdf_path, filled_path, text_values)
-                out_path = filled_path
-                if stamps:
-                    stamped_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-                    _to_unlink.append(stamped_path)
-                    try:
-                        stamp_signatures(filled_path, stamped_path, stamps)
-                        out_path = stamped_path
-                    except Exception as e:
-                        logger.warning(f"stamp_signatures failed for {doc_id}: {e}")
-
-                annotations = parse_markdown_annotations(doc.current_content or "")
-                if annotations:
-                    ann_sig_ids = [
-                        a["value"][len("signature:"):].strip()
-                        for a in annotations
-                        if a.get("kind") == "signature"
-                        and isinstance(a.get("value"), str)
-                        and a["value"].startswith("signature:")
-                    ]
-                    ann_signature_pngs: dict[str, bytes] = {}
-                    if ann_sig_ids:
-                        # SECURITY: filter by owner so a caller can't reference
-                        # someone else's signature ID from doc markdown and have
-                        # it stamped/exported.
-                        _sig_q = db.query(Signature).filter(Signature.id.in_(ann_sig_ids))
-                        if user:
-                            _sig_q = _sig_q.filter(Signature.owner == user)
-                        sig_rows = _sig_q.all()
-                        for s in sig_rows:
-                            try:
-                                ann_signature_pngs[s.id] = base64.b64decode(s.data_png)
-                            except Exception:
-                                pass
-                    annotated_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-                    _to_unlink.append(annotated_path)
-                    try:
-                        stamp_annotations(out_path, annotated_path, annotations, ann_signature_pngs)
-                        out_path = annotated_path
-                    except Exception as e:
-                        logger.warning(f"stamp_annotations failed for {doc_id}: {e}")
-
-                # 2) Move/copy into COMPOSE_UPLOADS_DIR with the token format
-                #    `<uuid>_<original_name>` that /api/email/send expects.
-                filename = _slug(doc.title or "signed") + "_signed.pdf"
-                token = f"{_uuid.uuid4().hex}_{filename}"
-                dest = _COMPOSE_DIR / token
-                shutil.copyfile(out_path, str(dest))
-                # Unlink the intermediate temp PDFs now that they've been
-                # copied into COMPOSE_UPLOADS_DIR.
-                for _p in _to_unlink:
-                    try:
-                        os.unlink(_p)
-                    except FileNotFoundError:
-                        pass
-                    except Exception as _e:
-                        logger.warning(f"Could not unlink temp PDF {_p}: {_e}")
-
-                # 3) Fetch the source email's headers so we can build a clean reply
-                #    context (To/Subject/In-Reply-To/References).
+                annotated_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+                _to_unlink.append(annotated_path)
                 try:
-                    from routes.email_routes import _imap, _decode_header
-                    from routes.email_helpers import _q
-                except Exception:
-                    _imap = None
-                    _decode_header = lambda x: x or ""
-                    _q = lambda x: x or ""
+                    stamp_annotations(out_path, annotated_path, annotations, ann_signature_pngs)
+                    out_path = annotated_path
+                except Exception as e:
+                    logger.warning(f"stamp_annotations failed for {doc_id}: {e}")
 
-                to_addr = ""
-                from_name = ""
-                subject = ""
-                in_reply_to = doc.source_email_message_id or ""
-                references = in_reply_to
-                if _imap:
-                    try:
-                        with _imap(doc.source_email_account_id or None) as conn:
-                            conn.select(_q(doc.source_email_folder), readonly=True)
-                            status, data = conn.fetch(doc.source_email_uid.encode(), "(RFC822.HEADER)")
-                        if status == "OK" and data and data[0]:
-                            raw_hdr = data[0][1]
-                            m = _email_mod.message_from_bytes(raw_hdr)
-                            sender = _decode_header(m.get("From", ""))
-                            from_name, to_addr = _email_mod.utils.parseaddr(sender)
-                            if not to_addr:
-                                to_addr = sender
-                            subject = _decode_header(m.get("Subject", "") or "")
-                            if subject and not subject.lower().startswith("re:"):
-                                subject = "Re: " + subject
-                            msg_refs = (m.get("References") or "").strip()
-                            msg_in_reply = (m.get("Message-ID") or "").strip() or in_reply_to
-                            in_reply_to = msg_in_reply
-                            references = (msg_refs + " " + msg_in_reply).strip() if msg_refs else msg_in_reply
-                    except Exception as e:
-                        logger.warning(f"prepare-signed-reply header fetch failed: {e}")
+            # 2) Move/copy into COMPOSE_UPLOADS_DIR with the token format
+            #    `<uuid>_<original_name>` that /api/email/send expects.
+            filename = _slug(doc.title or "signed") + "_signed.pdf"
+            token = f"{_uuid.uuid4().hex}_{filename}"
+            dest = _COMPOSE_DIR / token
+            shutil.copyfile(out_path, str(dest))
+            # Unlink the intermediate temp PDFs now that they've been
+            # copied into COMPOSE_UPLOADS_DIR.
+            for _p in _to_unlink:
+                try:
+                    os.unlink(_p)
+                except FileNotFoundError:
+                    pass
+                except Exception as _e:
+                    logger.warning(f"Could not unlink temp PDF {_p}: {_e}")
 
-                return {
-                    "ok": True,
-                    "attachment": {
-                        "token": token,
-                        "filename": filename,
-                        "size": dest.stat().st_size,
-                    },
-                    "reply": {
-                        "to": to_addr,
-                        "to_name": from_name,
-                        "subject": subject,
-                        "in_reply_to": in_reply_to,
-                        "references": references,
-                        "account_id": doc.source_email_account_id or None,
-                        "source_uid": doc.source_email_uid,
-                        "source_folder": doc.source_email_folder,
-                        "source_message_id": doc.source_email_message_id,
-                    },
-                }
+            # 3) Fetch the source email's headers so we can build a clean reply
+            #    context (To/Subject/In-Reply-To/References).
+            try:
+                from routes.email_routes import _imap, _decode_header
+                from routes.email_helpers import _q
+            except Exception:
+                _imap = None
+                _decode_header = lambda x: x or ""
+                _q = lambda x: x or ""
+
+            to_addr = ""
+            from_name = ""
+            subject = ""
+            in_reply_to = doc.source_email_message_id or ""
+            references = in_reply_to
+            if _imap:
+                try:
+                    with _imap(doc.source_email_account_id or None) as conn:
+                        conn.select(_q(doc.source_email_folder), readonly=True)
+                        status, data = conn.fetch(doc.source_email_uid.encode(), "(RFC822.HEADER)")
+                    if status == "OK" and data and data[0]:
+                        raw_hdr = data[0][1]
+                        m = _email_mod.message_from_bytes(raw_hdr)
+                        sender = _decode_header(m.get("From", ""))
+                        from_name, to_addr = _email_mod.utils.parseaddr(sender)
+                        if not to_addr:
+                            to_addr = sender
+                        subject = _decode_header(m.get("Subject", "") or "")
+                        if subject and not subject.lower().startswith("re:"):
+                            subject = "Re: " + subject
+                        msg_refs = (m.get("References") or "").strip()
+                        msg_in_reply = (m.get("Message-ID") or "").strip() or in_reply_to
+                        in_reply_to = msg_in_reply
+                        references = (msg_refs + " " + msg_in_reply).strip() if msg_refs else msg_in_reply
+                except Exception as e:
+                    logger.warning(f"prepare-signed-reply header fetch failed: {e}")
+
+            return {
+                "ok": True,
+                "attachment": {
+                    "token": token,
+                    "filename": filename,
+                    "size": dest.stat().st_size,
+                },
+                "reply": {
+                    "to": to_addr,
+                    "to_name": from_name,
+                    "subject": subject,
+                    "in_reply_to": in_reply_to,
+                    "references": references,
+                    "account_id": doc.source_email_account_id or None,
+                    "source_uid": doc.source_email_uid,
+                    "source_folder": doc.source_email_folder,
+                    "source_message_id": doc.source_email_message_id,
+                },
+            }
         finally:
             db.close()
 

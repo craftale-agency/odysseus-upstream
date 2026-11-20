@@ -16,7 +16,57 @@ from __future__ import annotations
 import json
 import os
 import uuid
+import functools
+import threading
 from typing import Any, Optional
+
+
+_STORE_LOCKS: dict[str, threading.RLock] = {}
+_STORE_LOCKS_GUARD = threading.Lock()
+_STORE_ACTIVE_PATHS = threading.local()
+
+
+def store_transaction(path_factory):
+    """Serialize a JSON read/modify/write across runtime threads and processes."""
+    def decorate(function):
+        @functools.wraps(function)
+        def locked(*args, **kwargs):
+            path = os.path.abspath(str(path_factory())) + ".lock"
+            with _STORE_LOCKS_GUARD:
+                lock = _STORE_LOCKS.setdefault(path, threading.RLock())
+            with lock:
+                active = getattr(_STORE_ACTIVE_PATHS, "paths", None)
+                if active is None:
+                    active = set()
+                    _STORE_ACTIVE_PATHS.paths = active
+                if path in active:
+                    return function(*args, **kwargs)
+                active.add(path)
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "a+b") as handle:
+                        if os.name == "nt":
+                            import msvcrt
+                            if os.fstat(handle.fileno()).st_size == 0:
+                                handle.write(b"0")
+                                handle.flush()
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(handle, fcntl.LOCK_EX)
+                        try:
+                            return function(*args, **kwargs)
+                        finally:
+                            if os.name == "nt":
+                                handle.seek(0)
+                                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                            else:
+                                fcntl.flock(handle, fcntl.LOCK_UN)
+                finally:
+                    active.discard(path)
+        return locked
+    return decorate
 
 
 def atomic_write_json(path: str, data: Any, *, indent: Optional[int] = None) -> None:

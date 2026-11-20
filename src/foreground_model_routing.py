@@ -138,6 +138,7 @@ def resolve_foreground_model_policy(
             entries,
             owner=owner,
             require_exact_model=True,
+            required_model_type="llm",
         )
     candidates = [candidate for candidate, _descriptor in resolved_routes]
     if not candidates:
@@ -240,7 +241,16 @@ def build_foreground_route_descriptors(
             owner=owner,
         )
     if selected is None:
-        selected = resolve_route_descriptor(endpoint_url, model, headers or {}, owner=owner)
+        if selected_endpoint_id:
+            # An explicit identity must never be relabelled as another account
+            # with the same URL/model (or even the same current bearer).
+            selected = {
+                "endpoint_id": None,
+                "endpoint_label": "Selected route",
+                "endpoint_cost_tracked": endpoint_cost_tracked(endpoint_url),
+            }
+        else:
+            selected = resolve_route_descriptor(endpoint_url, model, headers or {}, owner=owner)
     primary = (endpoint_url, model, headers or {})
     candidates = [primary]
     descriptors = [selected]
