@@ -30,6 +30,7 @@ def test_concatenated_multiple_keeps_last_non_empty():
     assert json.loads(block.content) == {"b": 2}
 
 
+<<<<<<< ours
 def test_all_empty_objects_is_valid_empty_args():
     from src.tool_schemas import function_call_to_tool_block
 
@@ -40,6 +41,13 @@ def test_all_empty_objects_is_valid_empty_args():
 
     block = function_call_to_tool_block("ask_user", "{}{}")
     assert block is not None and _json.loads(block.content) == {}
+=======
+def test_all_empty_objects_still_fails():
+    from src.tool_schemas import function_call_to_tool_block
+
+    # Nothing recoverable — must stay a hard failure, not fabricate args.
+    assert function_call_to_tool_block("ask_user", "{}{}") is None
+>>>>>>> theirs
 
 
 def test_trailing_garbage_is_not_recovered():
