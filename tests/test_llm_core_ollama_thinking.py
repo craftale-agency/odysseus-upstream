@@ -173,7 +173,6 @@ class TestThinkSuppression:
         )
         assert payload.get("think") is False
         assert not isinstance(payload.get("think"), str)
-<<<<<<< ours
     def test_qwen_tool_router_does_not_receive_ollama_think_override(self, monkeypatch):
         """A local OpenAI-compatible tool-router is not Ollama's /v1 surface."""
         payload = _capture_payload(
@@ -183,5 +182,3 @@ class TestThinkSuppression:
         )
         assert "think" not in payload
         assert payload["max_tokens"] == llm_core.LLMConfig.DEFAULT_MAX_TOKENS
-=======
->>>>>>> theirs
