@@ -148,7 +148,10 @@ function insertTranscription(text, showToast) {
 /**
  * Start voice recording
  */
-export function startRecording(onFileCreated, showToast, showError) {
+export function startRecording(onFileCreated, showToast, onError, onTranscript) {
+  // onTranscript (optional, craftale voice mode): called with the server-side
+  // transcript instead of only inserting it into #message — lets the voice
+  // mode loop auto-send. Falls back to plain insertion when not provided.
   // Check for secure context (getUserMedia requires HTTPS or localhost)
   if (!window.isSecureContext) {
     if (showError) showError('Microphone requires HTTPS. Use a reverse proxy with SSL or access via localhost.');
@@ -195,7 +198,8 @@ export function startRecording(onFileCreated, showToast, showError) {
           try {
             const transcript = await transcribeOnServer(audioBlob);
             if (transcript) {
-              insertTranscription(transcript, showToast);
+              if (onTranscript) { onTranscript(transcript); }
+              else { insertTranscription(transcript, showToast); }
             } else {
               if (showToast) showToast('No speech detected');
             }
