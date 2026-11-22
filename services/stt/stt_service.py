@@ -141,7 +141,7 @@ class STTService:
             data["language"] = language
 
         try:
-            r = httpx.post(url, headers=headers, files=files, data=data, timeout=60)
+            r = httpx.post(url, headers=headers, files=files, data=data, timeout=120)
             r.raise_for_status()
             result = r.json()
             text = result.get("text", "")
