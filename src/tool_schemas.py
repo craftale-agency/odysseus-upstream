@@ -1745,7 +1745,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_emails",
-            "description": "List emails from an account/folder, newest first; date_from is inclusive and date_to is exclusive, so today means today-to-tomorrow and last month means month-start to current-month-start. Returns subject, sender, date, UID, account, and summary.",
+            "description": "List emails from an account/folder, newest first; date_from is inclusive and date_to is exclusive, so today means today-to-tomorrow and last month means month-start to current-month-start. Returns subject, sender, date, UID, account, and summary. Pass refresh=true to force a live IMAP fetch when results look stale.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1757,6 +1757,8 @@ FUNCTION_TOOL_SCHEMAS = [
                     "date_from": {"type": "string", "description": "Inclusive ISO date/datetime lower bound, e.g. 2026-07-01 for last-month filtering."},
                     "date_to": {"type": "string", "description": "Exclusive ISO date/datetime upper bound, e.g. 2026-08-01 for last-month filtering."},
                     "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts, e.g. Gmail or user@example.com"},
+                    "account_id": {"type": "string", "description": "Alias of `account` (account UUID)."},
+                    "refresh": {"type": "boolean", "description": "Force a live IMAP fetch, bypassing the header index and caches (slower, always current). Use when the index looks stale.", "default": False},
                 },
             }
         }

@@ -1767,9 +1767,13 @@ def _indexed_latest_emails(
     return results
 
 
-def _list_header_page(conn, account, folder, uid_list):
-    """Reuse indexed headers, batch remote misses, leave per-UID fallback to caller."""
-    indexed_rows = _indexed_list_rows_by_uids(account, folder, [uid.decode() for uid in uid_list])
+def _list_header_page(conn, account, folder, uid_list, refresh=False):
+    """Reuse indexed headers, batch remote misses, leave per-UID fallback to caller.
+    refresh=True skips the index entirely so live UIDs never inherit stale headers."""
+    indexed_rows = (
+        {} if refresh else
+        _indexed_list_rows_by_uids(account, folder, [uid.decode() for uid in uid_list])
+    )
     headers_by_uid = {}
     missing_uids = [uid for uid in uid_list if uid.decode() not in indexed_rows]
     if missing_uids:
@@ -1806,11 +1810,13 @@ def _header_date_in_bounds(value, start, end):
 
 
 def _list_emails(folder="INBOX", max_results=20, unresponded_only=False,
-                 unread_only=False, account=None, date_from=None, date_to=None):
+                 unread_only=False, account=None, date_from=None, date_to=None,
+                 refresh=False):
     """List emails newest-first. By default returns the latest messages,
     including read mail, so it matches normal inbox UI expectations.
     Pass unread_only=True and/or unresponded_only=True for attention scans.
     account selects mailbox (None = default).
+    refresh=True skips the header index and reads live IMAP.
     """
     start, end = _search_date_bounds(date_from, date_to)
     max_results = max(1, int(max_results or 20))
@@ -1825,7 +1831,7 @@ def _list_emails(folder="INBOX", max_results=20, unresponded_only=False,
     )
     if fixture is not None:
         return fixture
-    indexed = _indexed_latest_emails(
+    indexed = None if refresh else _indexed_latest_emails(
         folder=folder,
         max_results=max_results,
         unresponded_only=unresponded_only,
@@ -1871,7 +1877,7 @@ def _list_emails(folder="INBOX", max_results=20, unresponded_only=False,
                 break
             if offset % page_size == 0:
                 indexed_rows, headers_by_uid = _list_header_page(
-                    conn, account, folder, uid_list[offset:offset + page_size])
+                    conn, account, folder, uid_list[offset:offset + page_size], refresh=refresh)
             uid_text = uid.decode()
             indexed = indexed_rows.get(uid_text)
             if indexed is not None:
@@ -1942,7 +1948,7 @@ def _result_sort_time(result: dict) -> datetime:
 
 def _list_emails_across_accounts(folder="INBOX", max_results=20,
                                  unresponded_only=False, unread_only=False,
-                                 date_from=None, date_to=None):
+                                 date_from=None, date_to=None, refresh=False):
     fixture = _fixture_list_emails(
         folder,
         max_results,
@@ -1972,12 +1978,12 @@ def _list_emails_across_accounts(folder="INBOX", max_results=20,
         str(date_to or ""),
         tuple(str(row.get("id") or row.get("name") or row.get("imap_user") or "") for row in rows),
     )
-    cached = _EMAIL_LIST_CACHE.get(cache_key)
+    cached = None if refresh else _EMAIL_LIST_CACHE.get(cache_key)
     now = time.monotonic()
     if cached and now - float(cached.get("created") or 0) <= _EMAIL_LIST_CACHE_TTL_SECONDS:
         return [dict(item) for item in cached.get("results") or []], list(cached.get("errors") or [])
 
-    indexed = _indexed_latest_emails(
+    indexed = None if refresh else _indexed_latest_emails(
         folder=folder,
         max_results=max_results,
         unresponded_only=unresponded_only,
@@ -2007,6 +2013,7 @@ def _list_emails_across_accounts(folder="INBOX", max_results=20,
                 account=account_selector,
                 date_from=date_from,
                 date_to=date_to,
+                refresh=refresh,
             )
             for item in account_results:
                 item["_account"] = account_name
@@ -3680,7 +3687,8 @@ async def list_tools() -> list[Tool]:
                 "List unread or unresponded emails from the inbox. "
                 "Returns subject, sender, date, and cached AI summary for each. "
                 "Use this to check what emails need attention. "
-                "Pass `account` to scan a non-default mailbox."
+                "Pass `account` to scan a non-default mailbox. "
+                "Pass refresh=true to force a live IMAP fetch when results look stale."
             ),
             inputSchema={
                 "type": "object",
@@ -3712,6 +3720,15 @@ async def list_tools() -> list[Tool]:
                     "date_to": {
                         "type": "string",
                         "description": "Exclusive ISO date/datetime upper bound, e.g. 2026-08-01 for last-month filtering.",
+                    },
+                    "refresh": {
+                        "type": "boolean",
+                        "description": "Force a live IMAP fetch, bypassing the header index and caches (slower, always current). Use when the index looks stale.",
+                        "default": False,
+                    },
+                    "account_id": {
+                        "type": "string",
+                        "description": "Alias of `account` (account UUID). Accepted for convenience by API-style callers.",
                     },
                     **ACCOUNT_PROP,
                 },
@@ -4147,7 +4164,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             return [TextContent(type="text", text="\n".join(lines))]
 
-        acct = arguments.get("account")  # consumed by all email ops
+        acct = arguments.get("account") or arguments.get("account_id")  # consumed by all email ops
 
         if name == "list_emails":
             # Reject invalid ranges once, before fixture/cache/account dispatch;
@@ -4156,6 +4173,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_results = arguments.get("max_results", arguments.get("limit", 20))
             unresponded_only = arguments.get("unresponded_only", False)
             unread_only = arguments.get("unread_only", False)
+            refresh = arguments.get("refresh", False)
             # Build a header note so the LLM always knows which account was hit
             # AND what other accounts exist. Prevents "I can see emails" →
             # user: "I have 2 inboxes" → "which one?" loop.
@@ -4170,6 +4188,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     unread_only=unread_only,
                     date_from=arguments.get("date_from"),
                     date_to=arguments.get("date_to"),
+                    refresh=refresh,
                 )
                 account_names = [
                     f"{a.get('name') or a.get('imap_user')} <{a.get('imap_user') or a.get('from_address') or '?'}>"
@@ -4188,6 +4207,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     account=acct,
                     date_from=arguments.get("date_from"),
                     date_to=arguments.get("date_to"),
+                    refresh=refresh,
                 )
                 if _fixture_email_enabled():
                     active_cfg = next(
