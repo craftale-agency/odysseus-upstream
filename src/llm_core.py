@@ -3000,25 +3000,61 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: Op
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground",
-                     thinking_mode: Optional[str] = None, reasoning_effort: Optional[str] = None):
+                     thinking_mode: Optional[str] = None, reasoning_effort: Optional[str] = None,
+                     empty_retry_attempts: int = 0):
+    """Stream LLM responses, optionally retrying the SAME model when a whole
+    stream ends without any substantive output (thinking models burning the
+    entire output budget). Mirrors ForegroundModelPolicy.empty_retry_attempts:
+    chat_routes passes the policy value straight through; 0 keeps the
+    historical single-shot behaviour."""
     target_url = _stream_target_url(url)
-    async with _local_model_slot(target_url, model, workload):
-        async for chunk in _stream_llm_inner(
-            url,
-            model,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            headers=headers,
-            timeout=timeout,
-            prompt_type=prompt_type,
-            tools=tools,
-            session_id=session_id,
-            tool_choice_none=tool_choice_none,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
-        ):
-            yield chunk
+    attempts = max(0, int(empty_retry_attempts or 0)) + 1
+    for attempt in range(attempts):
+        produced_substantive = False
+        async with _local_model_slot(target_url, model, workload):
+            async for chunk in _stream_llm_inner(
+                url,
+                model,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                headers=headers,
+                timeout=timeout,
+                prompt_type=prompt_type,
+                tools=tools,
+                session_id=session_id,
+                tool_choice_none=tool_choice_none,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            ):
+                if _chunk_is_substantive(chunk):
+                    produced_substantive = True
+                yield chunk
+        if produced_substantive:
+            return
+        if attempt < attempts - 1:
+            logger.warning(
+                "[empty-retry] %s returned no substantive output (attempt %d/%d); retrying same model",
+                model, attempt + 1, attempts,
+            )
+
+
+def _chunk_is_substantive(chunk: str) -> bool:
+    """A substantive chunk carries visible text content or tool calls."""
+    try:
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict) and (parsed.get("delta") or parsed.get("type") == "tool_calls"):
+                return True
+    except (ValueError, TypeError):
+        return True
+    return False
 
 
 async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperature: Optional[float] = None,
