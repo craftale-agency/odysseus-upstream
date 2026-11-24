@@ -898,7 +898,7 @@ from routes.tts_routes import setup_tts_routes
 app.include_router(setup_tts_routes(tts_service))
 
 # STT
-from services.stt import get_stt_service
+from services.stt import get_stt_service, prewarm_at_startup, prewarm_enabled
 stt_service = get_stt_service()
 from routes.stt_routes import setup_stt_routes
 app.include_router(setup_stt_routes(stt_service))
@@ -1383,6 +1383,13 @@ async def _startup_event():
                     await asyncio.sleep(300)  # Back off on error
 
         _startup_tasks.append(asyncio.create_task(_keepalive_loop()))
+
+    # Remote Whisper endpoints load their model lazily, so the first
+    # transcription after a restart pays the cold load (tens of seconds on a
+    # CPU server). One silent request through the normal path warms it; it is
+    # a no-op when STT is off (ODYSSEUS_STT_PREWARM=0 to disable).
+    if prewarm_enabled():
+        _startup_tasks.append(asyncio.create_task(prewarm_at_startup(stt_service)))
 
     async def _ensure_default_tasks():
         # Create/reconcile default automation tasks + personal assistant for every user.
