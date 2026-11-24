@@ -312,6 +312,7 @@ def setup_codex_routes(
         from_addr: str | None = None,
         account_id: str | None = None,
         has_attachments: int = 0,
+        refresh: int = 0,
     ):
         owner = _scope_owner(request, EMAIL_READ_SCOPES)
         if email_list_endpoint is None:
@@ -322,11 +323,14 @@ def setup_codex_routes(
             from routes.email_helpers import _assert_owns_account
 
             _assert_owns_account(account_id, owner)
-        # cached_only=0 explicitly: calling the FastAPI handler directly
-        # bypasses DI, so an unset `cached_only` keeps its truthy Query(0)
-        # default object and every list silently served the stale local
-        # index (never IMAP) unless from_addr was set. cache_bust=None keeps
-        # the shared 8s memory cache for repeated identical lists.
+        # cached_only=0 / date_from=None / date_to=None / refresh explicitly:
+        # calling the FastAPI handler directly bypasses DI, so any unset
+        # parameter keeps its truthy Query(...) default object — cached_only
+        # served the stale local index (never IMAP), date_from/date_to blew up
+        # in strptime with a TypeError. cache_bust=None keeps the shared 8s
+        # memory cache for repeated identical lists; refresh=1 forwards the
+        # force-live flag to the real handler (same semantics as the
+        # authenticated /api/emails/list route).
         return await email_list_endpoint(
             folder=folder,
             limit=limit,
@@ -335,7 +339,10 @@ def setup_codex_routes(
             from_addr=from_addr,
             account_id=account_id,
             has_attachments=has_attachments,
+            date_from=None,
+            date_to=None,
             cached_only=0,
+            refresh=refresh,
             cache_bust=None,
             owner=owner,
         )
