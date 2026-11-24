@@ -477,35 +477,40 @@ if AUTH_ENABLED:
                             matched_owner = owner
                             matched_scopes = scopes or []
                             break
-                    if matched_id:
-                        # Update last_used_at off the hot path. Doing it
-                        # inline used to keep the request open across an
-                        # extra commit; do it fire-and-forget instead.
-                        async def _touch_last_used(tid: str):
-                            def _do():
-                                _db = SessionLocal()
-                                try:
-                                    _db.query(ApiToken).filter(ApiToken.id == tid).update(
-                                        {"last_used_at": datetime.utcnow()}
-                                    )
-                                    _db.commit()
-                                finally:
-                                    _db.close()
-                            try:
-                                await _asyncio.to_thread(_do)
-                            except Exception as _e:
-                                logger.debug("Failed to update token last_used_at", exc_info=_e)
-                        _asyncio.create_task(_touch_last_used(matched_id))
-                        # Keep bearer-token callers out of normal cookie/user
-                        request.state.current_user = "api"
-                        request.state.api_token = True
-                        request.state.api_token_id = matched_id
-                        request.state.api_token_owner = matched_owner
-                        request.state.api_token_scopes = matched_scopes
-                        return await call_next(request)
                 except Exception:
-                    logger.warning("API token auth error", exc_info=False)
-                # Invalid bearer token — reject immediately
+                    # Validation-only scope: a failure HERE means the token
+                    # check itself broke. call_next must stay outside so a
+                    # downstream 500 surfaces as 500, not as this 401 (which
+                    # masked real route errors as "Invalid API token").
+                    logger.warning("API token auth error", exc_info=True)
+                    return JSONResponse(status_code=401, content={"error": "Invalid API token"})
+                if matched_id:
+                    # Update last_used_at off the hot path. Doing it
+                    # inline used to keep the request open across an
+                    # extra commit; do it fire-and-forget instead.
+                    async def _touch_last_used(tid: str):
+                        def _do():
+                            _db = SessionLocal()
+                            try:
+                                _db.query(ApiToken).filter(ApiToken.id == tid).update(
+                                    {"last_used_at": datetime.utcnow()}
+                                )
+                                _db.commit()
+                            finally:
+                                _db.close()
+                        try:
+                            await _asyncio.to_thread(_do)
+                        except Exception as _e:
+                            logger.debug("Failed to update token last_used_at", exc_info=_e)
+                    _asyncio.create_task(_touch_last_used(matched_id))
+                    # Keep bearer-token callers out of normal cookie/user
+                    request.state.current_user = "api"
+                    request.state.api_token = True
+                    request.state.api_token_id = matched_id
+                    request.state.api_token_owner = matched_owner
+                    request.state.api_token_scopes = matched_scopes
+                    return await call_next(request)
+                # No candidate matched — invalid bearer token, reject
                 return JSONResponse(status_code=401, content={"error": "Invalid API token"})
 
             # --- Cookie-based session auth ---
