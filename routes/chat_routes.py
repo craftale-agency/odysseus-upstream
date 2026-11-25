@@ -4258,7 +4258,14 @@ def setup_chat_routes(
                         progress_callback=_image_progress_callback,
                     ))
                 else:
-                    _img_task = asyncio.create_task(do_generate_image(f"{_user_msg}\n{sess.model}\n512x512", session, owner=_user))
+                    # JSON args, not the multi-line format: a newline in the
+                    # user message would shift model/size by one line
+                    # ("512x512" parsed as the model name).
+                    _img_task = asyncio.create_task(do_generate_image(json.dumps({
+                        "prompt": _user_msg,
+                        "model": sess.model,
+                        "size": "512x512",
+                    }), session, owner=_user))
                 _img_started = time.time()
                 _img_tick = 0
                 while not _img_task.done():
