@@ -1,14 +1,41 @@
 # services/stt/stt_service.py
 """Multi-provider Speech-to-Text service — dispatches to local Whisper, OpenAI-compatible API, or browser."""
 
+import asyncio
 import io
 import logging
+import os
+import time
+import wave
 import httpx
 import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+# Boot-time pre-warm of a remote STT endpoint (STTService.prewarm). On by
+# default; set ODYSSEUS_STT_PREWARM=0 to disable.
+PREWARM_ATTEMPTS = 2  # one request, plus a single retry if it fails
+PREWARM_RETRY_DELAY_S = 10.0
+
+
+def prewarm_enabled() -> bool:
+    return str(os.getenv("ODYSSEUS_STT_PREWARM", "1")).lower() not in {"0", "false", "no", "off"}
+
+
+def _prewarm_audio() -> bytes:
+    """A valid, near-empty upload: one second of silence as a 16 kHz mono WAV."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    return buf.getvalue()
+
+
+PREWARM_AUDIO = _prewarm_audio()
 
 
 class STTService:
@@ -173,6 +200,48 @@ class STTService:
             logger.error(f"Unknown STT provider: {provider}")
             return None
 
+    # ── Startup pre-warm ──
+
+    def prewarm(self) -> dict:
+        """Send a silent request through transcribe() so a remote STT endpoint
+        loads the configured model before the first user request pays for it.
+
+        Sends nothing unless STT is enabled with an "endpoint:" provider.
+        Request failures are reported, not raised. Returns
+        {"status": "ok" | "failed" | "skipped", ...}; "failed" means all
+        PREWARM_ATTEMPTS requests failed.
+        """
+        started = time.perf_counter()
+        settings = self._load_settings()
+        provider = settings["stt_provider"]
+        reason = None
+        if settings.get("stt_enabled") is False:
+            reason = "stt_disabled"
+        elif not provider.startswith("endpoint:"):
+            reason = "provider_not_endpoint"
+        if reason:
+            return {
+                "status": "skipped",
+                "reason": reason,
+                "provider": provider,
+                "model": settings["stt_model"],
+            }
+
+        status = {"status": "failed", "provider": provider, "model": settings["stt_model"]}
+        for attempt in range(1, PREWARM_ATTEMPTS + 1):
+            status["attempt"] = attempt
+            try:
+                # "" is a valid transcript for silence; only None means failure.
+                if self.transcribe(PREWARM_AUDIO) is not None:
+                    status["status"] = "ok"
+                    break
+            except Exception as e:  # transcribe() already catches; the warm-up must not raise
+                logger.error(f"STT prewarm attempt raised: {e}")
+            if attempt < PREWARM_ATTEMPTS:
+                time.sleep(PREWARM_RETRY_DELAY_S)
+        status["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        return status
+
     def get_stats(self) -> Dict[str, Any]:
         settings = self._load_settings()
         provider = settings["stt_provider"]
@@ -206,3 +275,25 @@ def get_stt_service() -> STTService:
     if _stt_service is None:
         _stt_service = STTService()
     return _stt_service
+
+
+async def prewarm_at_startup(service: Optional[STTService] = None) -> None:
+    """Startup task: run STTService.prewarm() off the event loop and log one
+    outcome line. Logs instead of raising: a warm-up must never break startup.
+    """
+    try:
+        status = await asyncio.to_thread((service or get_stt_service()).prewarm)
+        if status["status"] == "ok":
+            logger.info(
+                "stt prewarm: ok model=%s attempt=%s duration_ms=%s",
+                status["model"], status["attempt"], status["duration_ms"],
+            )
+        elif status["status"] == "failed":
+            logger.warning(
+                "stt prewarm: failed model=%s attempts=%s duration_ms=%s (non-critical)",
+                status["model"], status["attempt"], status["duration_ms"],
+            )
+        else:
+            logger.info(f"stt prewarm: skipped reason={status['reason']}")
+    except Exception as e:
+        logger.warning(f"stt prewarm: error (non-critical): {type(e).__name__}: {e}")
