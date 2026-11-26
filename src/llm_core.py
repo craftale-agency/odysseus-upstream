@@ -354,7 +354,28 @@ _VISIBLE_CHAT_TEMPLATE_ARTIFACT_RE = re.compile(
 
 
 def _strip_visible_chat_template_artifacts(text: str) -> str:
-    return _VISIBLE_CHAT_TEMPLATE_ARTIFACT_RE.sub("", text or "")
+    return _strip_gemma_control_tokens(
+        _VISIBLE_CHAT_TEMPLATE_ARTIFACT_RE.sub("", text or "")
+    )
+
+
+# Gemma 3/4 chat + tool protocol tokens. They delimit turns, tool calls and tool
+# results inside the rendered prompt, so one that shows up in a model's own
+# content is leaked template markup (or an answer made of nothing but a
+# delimiter) — never user-facing prose. The tool_call/tool_response forms REQUIRE
+# the leading pipe: the Qwen/Hermes `<tool_call>` tag has none and must stay in
+# the stream because the agent loop parses textual tool calls out of it.
+_GEMMA_CONTROL_TOKEN_RE = re.compile(
+    r"<\|tool_(?:call|response)\|?>"
+    r"|<tool_call\|>"
+    r"|<start_of_turn>"
+    r"|<end_of_turn>",
+    re.IGNORECASE,
+)
+
+
+def _strip_gemma_control_tokens(text: str) -> str:
+    return _GEMMA_CONTROL_TOKEN_RE.sub("", text or "")
 
 
 def _harmony_suffix_hold_len(text: str) -> int:

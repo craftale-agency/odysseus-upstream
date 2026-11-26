@@ -8,6 +8,7 @@ Provides token estimation for context usage tracking.
 import ipaddress
 import logging
 import os
+import re
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -347,6 +348,12 @@ def _lookup_known(model: str) -> Optional[int]:
     Picks the LONGEST matching key so a short key never shadows a more specific
     one. Without this, 'o1' (200k) precedes 'o1-mini' (128k) in the table and a
     first-match return would report o1-mini's window as 200k.
+
+    A key that carries a hyphen/underscore also matches the same family spelled
+    without it: the table follows the publisher's spelling ('gemma-4', 'gpt-4o')
+    while Ollama tags usually drop it ('gemma4-thinker:latest', 'gemma4:12b').
+    That spelling match must end the family word (no letter may follow), so
+    'gpt4all' is not taken for 'gpt-4'.
     """
     name = model.lower()
     basename = name.split("/")[-1] if "/" in name else name
@@ -355,8 +362,18 @@ def _lookup_known(model: str) -> Optional[int]:
     best_ctx: Optional[int] = None
     for key, ctx in KNOWN_CONTEXT_WINDOWS.items():
         if key in basename or key in name:
-            if best_key is None or len(key) > len(best_key):
-                best_key, best_ctx = key, ctx
+            matched = True
+        elif "-" in key or "_" in key:
+            # A miss here is not cosmetic: an unknown window makes the agent
+            # input budget fall back to the conservative default, which trims a
+            # long session down to a truncated system prompt plus the last
+            # user message on every turn.
+            compact = re.escape(key.replace("-", "").replace("_", ""))
+            matched = bool(re.search(compact + r"(?![a-z])", basename))
+        else:
+            matched = False
+        if matched and (best_key is None or len(key) > len(best_key)):
+            best_key, best_ctx = key, ctx
     return best_ctx
 
 

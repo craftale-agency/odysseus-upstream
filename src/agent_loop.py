@@ -34,6 +34,7 @@ from src.llm_core import (
     stream_llm,
     stream_llm_with_fallback,
     _strip_visible_chat_template_artifacts,
+    _strip_gemma_control_tokens,
     _is_ollama_native_url,
     _normalize_http_status,
     _normalize_usage_counts,
@@ -6109,6 +6110,11 @@ _INVISIBLE_RESPONSE_CHARS = "\u2063\u200b\u200c\u200d\ufeff"
 def _visible_response_text(text: str) -> str:
     """Return model-visible prose, ignoring invisible provider separators."""
     value = _strip_think_blocks(strip_tool_blocks(str(text or "")))
+    # Second line of defence for Gemma chat/tool protocol tokens, on the
+    # assembled turn: a reply that was nothing but `<|tool_response>` must read
+    # as empty here so the end-of-loop guard reports an empty response instead
+    # of saving the delimiter as the assistant's message.
+    value = _strip_gemma_control_tokens(value)
     # Some local Qwen chat templates suppress the opening <think> token while
     # still emitting its closing token. Everything before that orphan closer
     # is internal analysis; only the text after it belongs in chat.

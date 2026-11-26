@@ -460,6 +460,27 @@ def declared_context_window(client_runtime_context: Any) -> int:
     return value if value > 0 else 0
 
 
+def configured_context_window(endpoint_url: str, model: str) -> int:
+    """Window the operator saved for this endpoint and model, or 0.
+
+    Settings → Added Models stores an Ollama ``num_ctx`` per endpoint and
+    model: the window that server is actually run with. The legacy lookup
+    (``model_context.get_context_length``) trusts it ahead of discovery and
+    the typed resolution must too, or the static family table — which only
+    knows a family maximum — out-votes it for every tag it matches.
+    Imported lazily: this module sits below ``src.model_customization``.
+    """
+    if not endpoint_url or not model:
+        return 0
+    try:
+        from src.model_customization import context_window_override
+        value = int(context_window_override(endpoint_url, model) or 0)
+    except Exception as exc:
+        logger.debug("Configured context window lookup failed: %s", type(exc).__name__)
+        return 0
+    return value if value > 0 else 0
+
+
 async def resolve_effective_context(
     endpoint_url: str,
     model: str,
@@ -483,6 +504,11 @@ async def resolve_effective_context(
         observations.extend(result.observations)
         errors = result.errors
         provider_io = result.io and not cached
+    configured = configured_context_window(endpoint_url, model)
+    if configured:
+        observations.append(ContextObservation(
+            ContextEvidence.OPERATOR_DECLARED, configured, "model_customization",
+        ))
     declared = declared_context_window(client_runtime_context)
     if declared:
         observations.append(ContextObservation(

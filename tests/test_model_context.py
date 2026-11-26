@@ -222,6 +222,46 @@ class TestLookupKnown:
     def test_gpt4_base(self):
         assert _lookup_known("gpt-4") == 8192
 
+    def test_ollama_family_tag_without_hyphen(self):
+        """Ollama tags spell the family without the hyphen; the table keys it 'gemma-4'.
+
+        A miss reports the window as unknown, and the agent input budget then
+        collapses to the conservative default for every turn of a long session
+        (2026-11-25 Odypezzus: 30k-token route trimmed to 864 tokens).
+        """
+        assert _lookup_known("gemma4-thinker:latest") == 262144
+        assert _lookup_known("gemma4-fast:latest") == 262144
+        assert _lookup_known("gemma4:12b") == 262144
+        assert _lookup_known("gemma3-27b") == 128000
+
+    def test_unrelated_model_sharing_a_compact_prefix_stays_unknown(self):
+        """Only the family spelling may differ: 'gpt4all' is not the gpt-4 family."""
+        assert _lookup_known("gpt4all-lora") is None
+
+
+class TestProxyContextWindowForUnhyphenatedFamily:
+    """End-to-end window resolution behind an authenticated OpenAI-compatible proxy."""
+
+    URL = "https://openai.example.com/v1"
+
+    def _query(self, monkeypatch, model):
+        # Endpoint declared as a proxy; its /v1/models answers 401, so no catalog window.
+        monkeypatch.setattr(model_context, "_configured_endpoint_kind", lambda url: "proxy")
+        monkeypatch.setattr(model_context, "_proxy_catalog_context", lambda url, model: None)
+        return model_context._query_context_length(self.URL, model)
+
+    def test_window_is_known_without_a_catalog(self, monkeypatch):
+        assert self._query(monkeypatch, "gemma4-thinker:latest") == (262144, True)
+
+    def test_auto_budget_no_longer_collapses_to_the_default(self, monkeypatch):
+        from src.context_budget import DEFAULT_BUDGET, budget_is_explicit, compute_input_token_budget
+
+        ctx, known = self._query(monkeypatch, "gemma4-thinker:latest")
+        window = ctx if known else 0  # what budget_context_for_model returns
+        budget = compute_input_token_budget(DEFAULT_BUDGET, window, budget_is_explicit(DEFAULT_BUDGET))
+        assert budget > DEFAULT_BUDGET
+        assert budget == compute_input_token_budget(DEFAULT_BUDGET, 262144, False)
+
 
 class _FakeResp:
     def __init__(self, payload, ok=True):
